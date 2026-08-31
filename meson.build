@@ -491,6 +491,13 @@ endif
 features += {'android': host_machine.system() == 'android'}
 if features['android']
     dependencies += cc.find_library('android')
+    # Our forked `vo_mediacodec_embed.c` hands subtitles to Kotlin's
+    # `SubtitleView` (a regular Android `View`) via an extern Rust
+    # symbol — no EGL / GLES2 link needed. Symbols
+    # `torro_subtitle_present` / `torro_subtitle_clear` resolve at
+    # process load from the same APK's `libtorro_player_lib.so` (the
+    # Tauri / Rust cdylib is loaded BEFORE `libmpv.so` by
+    # `TauriActivity.<clinit>`).
     sources += files('misc/jni.c',
                      'osdep/android/strnlen.c',
                      'video/out/android_common.c',
