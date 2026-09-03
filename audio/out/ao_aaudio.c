@@ -397,7 +397,19 @@ static void start(struct ao *ao)
     struct priv *p = ao->priv;
 
     aaudio_result_t result;
-    p->discarded = p->AAudioStream_getFramesWritten(p->stream) - p->presented;
+    // Frames still queued in a PAUSED stream are played after
+    // requestStart(), so they must stay in the delay estimate; only a
+    // flushed or stopped stream has dropped them. mpv reaches start()
+    // on a paused stream after an underrun: buffer.c clears `playing`,
+    // the cache-pause resume in ao_set_paused() therefore skips
+    // set_pause(false), and player/audio.c restarts via ao_start()
+    // instead. Counting the retained buffer (up to the stream's
+    // capacity) as discarded made the reported delay that much too
+    // small, the video looked late by the same amount and was dropped
+    // frame after frame on a real-time-paced decoder.
+    aaudio_stream_state_t state = p->AAudioStream_getState(p->stream);
+    if (state != AAUDIO_STREAM_STATE_PAUSED && state != AAUDIO_STREAM_STATE_PAUSING)
+        p->discarded = p->AAudioStream_getFramesWritten(p->stream) - p->presented;
 
     if ((result = p->AAudioStream_requestStart(p->stream)) < 0) {
         MP_ERR(ao, "AAudioStream_requestStart() returned %s\n",
