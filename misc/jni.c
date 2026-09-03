@@ -21,6 +21,7 @@
 
 #include <libavcodec/jni.h>
 #include <stdlib.h>
+#include <sys/prctl.h>
 
 #include "jni.h"
 #include "mpv_talloc.h"
@@ -63,14 +64,25 @@ JNIEnv *mp_jni_get_env(struct mp_log *log)
 
     int ret = (*java_vm)->GetEnv(java_vm, (void **)&env, JNI_VERSION_1_6);
     switch(ret) {
-    case JNI_EDETACHED:
-        if ((*java_vm)->AttachCurrentThread(java_vm, &env, NULL) != 0) {
+    case JNI_EDETACHED: {
+        // ART renames a thread that attaches without a name to
+        // "Thread-N", which erases the name mp_thread_set_name gave it
+        // ("vo", "ao", "core", ...). Pass the current comm so the host
+        // can still find playback threads by name after the attach.
+        char name[16] = {0};
+        JavaVMAttachArgs args = {
+            .version = JNI_VERSION_1_6,
+            .name = prctl(PR_GET_NAME, name, 0, 0, 0) == 0 ? name : NULL,
+            .group = NULL,
+        };
+        if ((*java_vm)->AttachCurrentThread(java_vm, &env, &args) != 0) {
             mp_err(log, "Failed to attach the JNI environment to the current thread\n");
             env = NULL;
         } else {
             pthread_setspecific(current_env, env);
         }
         break;
+    }
     case JNI_OK:
         break;
     case JNI_EVERSION:
