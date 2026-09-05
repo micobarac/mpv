@@ -60,20 +60,13 @@
 // `parts` layout: 8 int32 per part, in this order:
 //   src_x, src_y, w, h, dst_x, dst_y, dst_w, dst_h
 // (src is into the atlas; dst is in canvas coords.)
-// `present_at_uptime_ms`: when the subtitle picture must become
-// visible, on Android's uptime clock (CLOCK_MONOTONIC ms, the clock
-// `View.postAtTime` takes). Frames are handed to the compositor
-// TORRO_EARLY_RELEASE_NS ahead of their display time (see flip_page),
-// so the subtitle for a frame is pushed that much early too and the
-// Kotlin side holds it until this instant. 0 = now.
 typedef void (*torro_subs_present_fn)(
     int32_t canvas_w, int32_t canvas_h,
     int32_t atlas_w,  int32_t atlas_h,
     const uint8_t *atlas_bgra,  // tight rows, stride = atlas_w * 4
     int32_t num_parts,
-    const int32_t *parts,
-    int64_t present_at_uptime_ms);
-typedef void (*torro_subs_clear_fn)(int64_t present_at_uptime_ms);
+    const int32_t *parts);
+typedef void (*torro_subs_clear_fn)(void);
 
 // How far ahead of its display time a decoded frame is handed to the
 // compositor with a presentation timestamp
@@ -146,8 +139,14 @@ struct priv {
     // Display time (mp_time ns) of `next_image`, from `vo_frame.pts`.
     // 0 for redraws, which release immediately.
     int64_t next_display_ns;
-    // Uptime-clock instant the current flip's subtitles must appear.
-    int64_t subs_at_uptime_ms;
+    // Frames handed to the compositor but not yet on screen: their
+    // display time and media pts. Subtitles are rendered for the frame
+    // that is on screen NOW, not the one just released 150 ms early —
+    // see flip_page. 8 slots cover the lead at any frame rate up to 50.
+    struct { int64_t display_ns; double pts; } in_flight[8];
+    int in_flight_n;
+    // Media pts of the frame currently on screen, -1 before the first.
+    double shown_pts;
 };
 
 // Translate an mp_time instant to Android's CLOCK_MONOTONIC (what
@@ -227,7 +226,7 @@ static void render_sub_bitmaps_cb(void *ctx, struct sub_bitmaps *imgs)
         !imgs->packed)
     {
         if (p->last_had_subs) {
-            if (g_subs_clear) g_subs_clear(p->subs_at_uptime_ms);
+            if (g_subs_clear) g_subs_clear();
             p->last_had_subs = false;
         }
         return;
@@ -282,17 +281,15 @@ static void render_sub_bitmaps_cb(void *ctx, struct sub_bitmaps *imgs)
     }
 
     if (g_subs_present)
-        g_subs_present(cw, ch, aw, ah, g_atlas_scratch, n, g_parts,
-                       p->subs_at_uptime_ms);
+        g_subs_present(cw, ch, aw, ah, g_atlas_scratch, n, g_parts);
     p->last_had_subs = true;
 }
 
-static void emit_subs(struct vo *vo, double pts, int64_t at_uptime_ms)
+static void emit_subs(struct vo *vo, double pts)
 {
     struct priv *p = vo->priv;
     if (!vo->params)
         return;
-    p->subs_at_uptime_ms = at_uptime_ms;
 
     // OSD canvas = SubtitleView's on-screen pixel size (Kotlin
     // pushes via `torro_set_subtitle_canvas`). Matters because
@@ -324,10 +321,29 @@ static void emit_subs(struct vo *vo, double pts, int64_t at_uptime_ms)
         // osd_draw chose not to invoke the callback (no subs to
         // render). Clear the SubtitleView so the previous frame's
         // text doesn't stay on screen.
-        if (g_subs_clear) g_subs_clear(at_uptime_ms);
+        if (g_subs_clear) g_subs_clear();
         p->last_had_subs = false;
         p->last_change_id = 0;
     }
+}
+
+// The frame on screen now is the newest in-flight frame whose display
+// time has passed. Drops everything older than it.
+static bool advance_shown_frame(struct priv *p)
+{
+    int64_t now = mp_time_ns();
+    int shown = -1;
+    for (int i = 0; i < p->in_flight_n; i++) {
+        if (p->in_flight[i].display_ns <= now)
+            shown = i;
+    }
+    if (shown < 0)
+        return false;
+    p->shown_pts = p->in_flight[shown].pts;
+    int keep = p->in_flight_n - (shown + 1);
+    memmove(p->in_flight, p->in_flight + shown + 1, keep * sizeof(p->in_flight[0]));
+    p->in_flight_n = keep;
+    return true;
 }
 
 // ---- Standard VO entry points ---------------------------------------------
@@ -337,6 +353,8 @@ static int preinit(struct vo *vo)
     struct priv *p = vo->priv;
     p->last_change_id = 0;
     p->last_had_subs = false;
+    p->in_flight_n = 0;
+    p->shown_pts = -1;
 
     vo->hwdec_devs = hwdec_devices_create();
     p->hwctx = (struct mp_hwdec_ctx){
@@ -361,21 +379,33 @@ static int preinit(struct vo *vo)
 static void flip_page(struct vo *vo)
 {
     struct priv *p = vo->priv;
-    double pts = 0;
-    int64_t at_uptime_ms = 0;
     if (p->next_image) {
         AVMediaCodecBuffer *buffer = (AVMediaCodecBuffer *)p->next_image->planes[3];
         if (p->next_display_ns > 0) {
-            int64_t mono_ns = mono_ns_for(p->next_display_ns);
-            av_mediacodec_render_buffer_at_time(buffer, mono_ns);
-            at_uptime_ms = mono_ns / INT64_C(1000000);
+            av_mediacodec_render_buffer_at_time(buffer, mono_ns_for(p->next_display_ns));
+            if (p->in_flight_n == MP_ARRAY_SIZE(p->in_flight)) {
+                memmove(p->in_flight, p->in_flight + 1,
+                        (p->in_flight_n - 1) * sizeof(p->in_flight[0]));
+                p->in_flight_n--;
+            }
+            p->in_flight[p->in_flight_n].display_ns = p->next_display_ns;
+            p->in_flight[p->in_flight_n].pts = p->next_image->pts;
+            p->in_flight_n++;
         } else {
+            // No timing: shown immediately, so it is the current frame.
             av_mediacodec_release_buffer(buffer, 1);
+            p->shown_pts = p->next_image->pts;
+            p->in_flight_n = 0;
         }
-        pts = p->next_image->pts;
         mp_image_unrefp(&p->next_image);
     }
-    emit_subs(vo, pts, at_uptime_ms);
+    // Subtitles follow the frame on screen, not the one just queued
+    // TORRO_EARLY_RELEASE_NS ahead: rendered for its pts and pushed
+    // immediately, so they are on time within one frame and never
+    // depend on the Android main thread.
+    advance_shown_frame(p);
+    if (p->shown_pts >= 0)
+        emit_subs(vo, p->shown_pts);
 }
 
 static bool draw_frame(struct vo *vo, struct vo_frame *frame)
@@ -401,6 +431,13 @@ static int query_format(struct vo *vo, int format)
 
 static int control(struct vo *vo, uint32_t request, void *data)
 {
+    struct priv *p = vo->priv;
+    if (request == VOCTRL_RESET) {
+        // Seek / flush: the queued frames will never be shown.
+        p->in_flight_n = 0;
+        p->shown_pts = -1;
+        return VO_TRUE;
+    }
     return VO_NOTIMPL;
 }
 
@@ -417,7 +454,7 @@ static void uninit(struct vo *vo)
 {
     struct priv *p = vo->priv;
     mp_image_unrefp(&p->next_image);
-    if (g_subs_clear) g_subs_clear(0);
+    if (g_subs_clear) g_subs_clear();
 
     hwdec_devices_remove(vo->hwdec_devs, &p->hwctx);
     av_buffer_unref(&p->hwctx.av_device_ref);
