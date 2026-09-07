@@ -1639,8 +1639,16 @@ void update_vo_chain_el_pair(struct MPContext *mpctx)
     if (!mpctx->vo_chain || !mpctx->vo_chain->filter)
         return;
     struct track *track = mpctx->current_track[0][STREAM_VIDEO];
-    mp_output_chain_set_el_stream(mpctx->vo_chain->filter,
-        track ? sh_stream_dependent_sibling(track->stream) : NULL);
+    struct sh_stream *el = track ? sh_stream_dependent_sibling(track->stream) : NULL;
+    // vo_mediacodec_embed hands the base-layer buffer straight to the display
+    // and never reads mp_image.enhancement_layer, so pairing would only open a
+    // second hardware decoder for output that is discarded. On single-instance
+    // decoders (MStar: "open too many component failed current:1 max:1") that
+    // second open is refused and the EL falls back to software decoding.
+    struct vo *vo = mpctx->vo_chain->vo;
+    if (el && vo && strcmp(vo->driver->name, "mediacodec_embed") == 0)
+        el = NULL;
+    mp_output_chain_set_el_stream(mpctx->vo_chain->filter, el);
 }
 
 void update_lavfi_complex(struct MPContext *mpctx)
