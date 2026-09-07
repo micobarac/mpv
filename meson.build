@@ -710,15 +710,6 @@ if features['lcms2']
     dependencies += lcms2
 endif
 
-# libdovi (dovi_tool's C API): Dolby Vision profile 7 -> 8.1 RPU rewriting
-# for single-layer hardware decoders. See demux/dovi_convert.c.
-libdovi = dependency('dovi', required: false)
-features += {'libdovi': libdovi.found()}
-if features['libdovi']
-    dependencies += libdovi
-    sources += files('demux/dovi_convert.c')
-endif
-
 libarchive = dependency('libarchive', version: '>= 3.4.0', required: get_option('libarchive'))
 features += {'libarchive': libarchive.found()}
 if features['libarchive']

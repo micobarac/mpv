@@ -2947,7 +2947,6 @@ const struct vo_driver video_out_gpu_next = {
     .caps = VO_CAP_ROTATE90 |
             VO_CAP_FILM_GRAIN |
             VO_CAP_VFLIP |
-            VO_CAP_ENHANCEMENT_LAYER |
             0x0,
     .preinit = preinit,
     .query_format = query_format,

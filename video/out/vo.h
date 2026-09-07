@@ -205,11 +205,6 @@ enum {
     VO_CAP_FRAMEOWNER   = 1 << 5,
     // VO does handle mp_image_params.vflip
     VO_CAP_VFLIP        = 1 << 6,
-    // VO renders mp_image.enhancement_layer (Dolby Vision profile 7 EL).
-    // Without it the player does not decode the EL track at all: a second
-    // decoder for frames nobody consumes, fatal on SoCs with one hardware
-    // HEVC instance (MStar: the EL decoder fell to software, 2026-09-06).
-    VO_CAP_ENHANCEMENT_LAYER = 1 << 7,
 };
 
 enum {

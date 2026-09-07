@@ -242,9 +242,6 @@ typedef struct MPOpts {
     bool video_osd;
 
     bool untimed;
-    // Torro: convert Dolby Vision profile 7 to 8.1 in the demuxer for
-    // single-layer hardware decoders (demux/dovi_convert.c).
-    bool torro_dovi_p7_convert;
     char *stream_dump;
     bool stop_playback_on_init_failure;
     int loop_times;
