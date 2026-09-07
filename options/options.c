@@ -832,6 +832,7 @@ static const m_option_t mp_opts[] = {
     {"video-latency-hacks", OPT_BOOL(video_latency_hacks)},
 
     {"untimed", OPT_BOOL(untimed)},
+    {"torro-dovi-p7-convert", OPT_BOOL(torro_dovi_p7_convert)},
 
     {"stream-dump", OPT_STRING(stream_dump), .flags = M_OPT_FILE},
 

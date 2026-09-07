@@ -56,6 +56,9 @@
 #include "video/mp_image.h"
 #include "demux.h"
 #include "dovi_split.h"
+#if HAVE_LIBDOVI
+#include "dovi_convert.h"
+#endif
 #include "packet_pool.h"
 #include "stheader.h"
 #include "ebml.h"
@@ -169,6 +172,11 @@ typedef struct mkv_track {
     AVDOVIDecoderConfigurationRecord *dovi_config;
     bstr hvce;
     struct mp_dovi_split *dovi_split;
+    // Profile 7 -> 8.1 conversion (--torro-dovi-p7-convert, HAVE_LIBDOVI).
+    // On the base-layer track; the separate EL track of a two-track file
+    // points at its base layer via dovi_el_target.
+    struct mp_dovi_convert *dovi_convert;
+    struct mkv_track *dovi_el_target;
 } mkv_track_t;
 
 typedef struct mkv_index {
@@ -191,6 +199,7 @@ struct block_info {
 
 typedef struct mkv_demuxer {
     struct demux_mkv_opts *opts;
+    bool dovi_p7_convert;
 
     int64_t segment_start, segment_end;
 
@@ -871,6 +880,9 @@ static void demux_mkv_free_trackentry(mkv_track_t *track)
 {
     talloc_free(track->parser_tmp);
     av_freep(&track->dovi_config);
+#if HAVE_LIBDOVI
+    TA_FREEP(&track->dovi_convert);
+#endif
     TA_FREEP(&track->dovi_split);
     talloc_free(track);
 }
@@ -1831,8 +1843,17 @@ done:
     demux_add_sh_stream(demuxer, sh);
 
     // Profile 7 NALU-interleaved
-    if (sh_v->dv_el_present)
-        track->dovi_split = mp_dovi_split_create(demuxer, sh);
+    if (sh_v->dv_el_present) {
+#if HAVE_LIBDOVI
+        if (mkv_d->dovi_p7_convert) {
+            track->dovi_convert = mp_dovi_convert_create(demuxer, sh, false);
+            if (track->dovi_convert)
+                mp_dovi_convert_fix_codec(sh->codec);
+        }
+        if (!track->dovi_convert)
+#endif
+            track->dovi_split = mp_dovi_split_create(demuxer, sh);
+    }
 
     return 0;
 }
@@ -2312,6 +2333,21 @@ static void pair_dovi_tracks(demuxer_t *demuxer)
     struct sh_stream *bl_sh = bl_track->stream;
     struct sh_stream *el_sh = el_track->stream;
 
+#if HAVE_LIBDOVI
+    if (mkv_d->dovi_p7_convert) {
+        bl_track->dovi_convert = mp_dovi_convert_create(demuxer, bl_sh, true);
+        if (bl_track->dovi_convert) {
+            el_track->dovi_el_target = bl_track;
+            mp_dovi_convert_fix_codec(bl_sh->codec);
+            // Hidden from track selection; its packets are consumed by
+            // the converter. No sh_stream_group: the player must not pair
+            // or decode the EL.
+            el_sh->dependent_track = true;
+            return;
+        }
+    }
+#endif
+
     // Group storage is attached to the BL so its lifetime tracks the demuxer.
     struct sh_stream_group *group = talloc_zero(bl_sh, struct sh_stream_group);
     MP_TARRAY_APPEND(group, group->members, group->num_members, bl_sh);
@@ -2517,6 +2553,7 @@ static int demux_mkv_open(demuxer_t *demuxer, enum demux_check check)
 
     struct MPOpts *mp_opts = mp_get_config_group(mkv_d, demuxer->global, &mp_opt_root);
     mkv_d->edition_id = mp_opts->edition_id;
+    mkv_d->dovi_p7_convert = mp_opts->torro_dovi_p7_convert;
     talloc_free(mp_opts);
 
     mkv_d->opts = mp_get_config_group(mkv_d, demuxer->global, &demux_mkv_conf);
@@ -2823,6 +2860,9 @@ static void mkv_seek_reset(demuxer_t *demuxer)
         track->av_parser = NULL;
         avcodec_free_context(&track->av_parser_codec);
         mp_dovi_split_reset(track->dovi_split);
+#if HAVE_LIBDOVI
+        mp_dovi_convert_reset(track->dovi_convert);
+#endif
     }
 
     for (int n = 0; n < mkv_d->num_blocks; n++)
@@ -2920,6 +2960,31 @@ fail:
     return -1;
 }
 
+#if HAVE_LIBDOVI
+static void drain_dovi_convert(demuxer_t *demuxer, mkv_track_t *track)
+{
+    struct demux_packet *out;
+    while ((out = mp_dovi_convert_pop(track->dovi_convert)))
+        add_packet(demuxer, track->stream, out);
+}
+
+// End of stream: hand out whatever the converters still hold. Returns
+// true if any packet was queued.
+static bool flush_dovi_converters(demuxer_t *demuxer)
+{
+    mkv_demuxer_t *mkv_d = demuxer->priv;
+    int before = mkv_d->num_packets;
+    for (int i = 0; i < mkv_d->num_tracks; i++) {
+        mkv_track_t *track = mkv_d->tracks[i];
+        if (!track->dovi_convert)
+            continue;
+        mp_dovi_convert_flush(track->dovi_convert);
+        drain_dovi_convert(demuxer, track);
+    }
+    return mkv_d->num_packets > before;
+}
+#endif
+
 static void mkv_parse_and_add_packet(demuxer_t *demuxer, mkv_track_t *track,
                                      struct demux_packet *dp)
 {
@@ -2970,6 +3035,18 @@ static void mkv_parse_and_add_packet(demuxer_t *demuxer, mkv_track_t *track,
     }
 
     if (!track->parse || !track->av_parser || !track->av_parser_codec) {
+#if HAVE_LIBDOVI
+        if (track->dovi_el_target && track->dovi_el_target->dovi_convert) {
+            mp_dovi_convert_push_el(track->dovi_el_target->dovi_convert, dp);
+            drain_dovi_convert(demuxer, track->dovi_el_target);
+            return;
+        }
+        if (track->dovi_convert) {
+            mp_dovi_convert_push_bl(track->dovi_convert, dp);
+            drain_dovi_convert(demuxer, track);
+            return;
+        }
+#endif
         struct demux_packet *el_dp = NULL;
         struct sh_stream *el_sh = NULL;
         if (track->dovi_split) {
@@ -3123,7 +3200,12 @@ static int handle_block(demuxer_t *demuxer, struct block_info *block_info)
                                     ? mp_dovi_split_el_stream(track->dovi_split)
                                     : NULL;
     bool need_for_split = split_el && demux_stream_is_selected(split_el);
-    if (!demux_stream_is_selected(stream) && !need_for_split)
+    // Likewise read the separate EL track while its base layer plays: the
+    // converter lifts the RPU out of it.
+    bool need_for_merge = track->dovi_el_target &&
+                          track->dovi_el_target->dovi_convert &&
+                          demux_stream_is_selected(track->dovi_el_target->stream);
+    if (!demux_stream_is_selected(stream) && !need_for_split && !need_for_merge)
         return 0;
 
     current_pts = tc / 1e9 - track->codec_delay;
@@ -3433,8 +3515,13 @@ static bool demux_mkv_read_packet(struct demuxer *demuxer,
         int res;
         struct block_info block;
         res = read_next_block(demuxer, &block);
-        if (res < 0)
+        if (res < 0) {
+#if HAVE_LIBDOVI
+            if (flush_dovi_converters(demuxer))
+                continue;
+#endif
             return false;
+        }
         if (res > 0) {
             handle_block(demuxer, &block);
             free_block(&block);

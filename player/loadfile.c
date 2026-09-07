@@ -1639,8 +1639,12 @@ void update_vo_chain_el_pair(struct MPContext *mpctx)
     if (!mpctx->vo_chain || !mpctx->vo_chain->filter)
         return;
     struct track *track = mpctx->current_track[0][STREAM_VIDEO];
+    // Only outputs that can render the enhancement layer get the pairing;
+    // for every other VO the EL decoder would be pure cost.
+    struct vo *vo = mpctx->video_out;
+    bool vo_renders_el = vo && (vo->driver->caps & VO_CAP_ENHANCEMENT_LAYER);
     mp_output_chain_set_el_stream(mpctx->vo_chain->filter,
-        track ? sh_stream_dependent_sibling(track->stream) : NULL);
+        (track && vo_renders_el) ? sh_stream_dependent_sibling(track->stream) : NULL);
 }
 
 void update_lavfi_complex(struct MPContext *mpctx)
