@@ -543,13 +543,8 @@ static void select_and_set_hwdec(struct mp_filter *vd)
             for (int n = 0; n < num_hwdecs; n++) {
                 struct hwdec_info *hwdec = &hwdecs[n];
 
-                // An explicit name selects exactly that variant. Upstream also
-                // matches the method name, so `hwdec=mediacodec` enrolled
-                // `mediacodec-copy` as the next candidate: on a VO that takes
-                // hardware frames only it can never display anything, and on a
-                // single-instance SoC its decoder request lands while the first
-                // instance is still being released (2026-09-06, MStar).
-                if (!hwdec_auto && !bstr_equals0(opt, hwdec->name))
+                if (!hwdec_auto && !(bstr_equals0(opt, hwdec->method_name) ||
+                                    bstr_equals0(opt, hwdec->name)))
                     continue;
                 hwdec_name_supported = true;
 
