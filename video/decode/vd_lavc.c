@@ -543,8 +543,13 @@ static void select_and_set_hwdec(struct mp_filter *vd)
             for (int n = 0; n < num_hwdecs; n++) {
                 struct hwdec_info *hwdec = &hwdecs[n];
 
-                if (!hwdec_auto && !(bstr_equals0(opt, hwdec->method_name) ||
-                                    bstr_equals0(opt, hwdec->name)))
+                // An explicit name selects exactly that variant. Upstream also
+                // matches the method name, so `hwdec=mediacodec` enrolled
+                // `mediacodec-copy` as the next candidate: on a VO that takes
+                // hardware frames only it can never display anything, and on a
+                // single-instance SoC its decoder request lands while the first
+                // instance is still being released (2026-09-06, MStar).
+                if (!hwdec_auto && !bstr_equals0(opt, hwdec->name))
                     continue;
                 hwdec_name_supported = true;
 
@@ -646,6 +651,9 @@ static void select_and_set_hwdec(struct mp_filter *vd)
         if (ctx->hwdec_opts->software_fallback == INT_MAX) {
             MP_WARN(ctx, "Software decoding fallback is disabled.\n");
             ctx->force_eof = true;
+        } else if (ctx->num_attempted_hwdecs > 0) {
+            MP_WARN(vd, "Using software decoding after %d failed hwdec attempt(s).\n",
+                    ctx->num_attempted_hwdecs);
         } else {
             MP_VERBOSE(vd, "Using software decoding.\n");
         }
@@ -685,9 +693,10 @@ static void force_fallback(struct mp_filter *vd)
     vd_ffmpeg_ctx *ctx = vd->priv;
 
     uninit_avctx(vd);
-    int lev = ctx->hwdec_notified ? MSGL_WARN : MSGL_V;
-    mp_msg(vd->log, lev, "Attempting next decoding method after failure of %.*s.\n",
-           BSTR_P(ctx->attempted_hwdecs[ctx->num_attempted_hwdecs - 1]));
+    // Always warn: before the first frame this was verbose, which hid the
+    // reason a hardware decoder was abandoned during startup.
+    MP_WARN(vd, "Attempting next decoding method after failure of %.*s.\n",
+            BSTR_P(ctx->attempted_hwdecs[ctx->num_attempted_hwdecs - 1]));
     select_and_set_hwdec(vd);
     init_avctx(vd);
 }
@@ -1079,8 +1088,13 @@ static enum AVPixelFormat get_format_hwdec(struct AVCodecContext *avctx,
         }
     }
 
-    if (select == AV_PIX_FMT_NONE)
+    if (select == AV_PIX_FMT_NONE) {
+        MP_WARN(vd, "Decoder offered no usable hwdec pixel format for %s; "
+                "hwdec %s abandoned.\n", avcodec_profile_name(avctx->codec_id, avctx->profile)
+                ? avcodec_profile_name(avctx->codec_id, avctx->profile) : "unknown profile",
+                ctx->hwdec.name);
         ctx->hwdec_failed = true;
+    }
 
     const char *name = av_get_pix_fmt_name(select);
     MP_VERBOSE(vd, "Requesting pixfmt '%s' from decoder.\n", name ? name : "-");
