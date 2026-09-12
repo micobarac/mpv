@@ -227,10 +227,9 @@ void osd_set_sub(struct osd_state *osd, int index, struct dec_sub *dec_sub)
 
 bool osd_get_render_subs_in_filter(struct osd_state *osd)
 {
-    mp_mutex_lock(&osd->lock);
-    bool r = osd->render_subs_in_filter;
-    mp_mutex_unlock(&osd->lock);
-    return r;
+    // Kodi 21.2 RenderManager.cpp:700-723: keep video submission independent
+    // of overlay rasterization. This query needs no renderer-owned objects.
+    return atomic_load(&osd->render_subs_in_filter);
 }
 
 void osd_set_render_subs_in_filter(struct osd_state *osd, bool s)
@@ -516,11 +515,10 @@ void osd_changed(struct osd_state *osd)
 
 bool osd_query_and_reset_want_redraw(struct osd_state *osd)
 {
-    mp_mutex_lock(&osd->lock);
-    bool r = osd->want_redraw_notification;
-    osd->want_redraw_notification = false;
-    mp_mutex_unlock(&osd->lock);
-    return r;
+    // Same video/overlay separation as RenderManager.cpp:700-723. Consume
+    // with one exchange so a concurrent notification is never overwritten
+    // by a separate load followed by a clear.
+    return atomic_exchange(&osd->want_redraw_notification, false);
 }
 
 struct mp_osd_res osd_get_vo_res(struct osd_state *osd)

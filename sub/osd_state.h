@@ -72,11 +72,15 @@ struct osd_state {
 
     struct osd_object *objs[MAX_OSD_PARTS];
 
-    bool render_subs_in_filter;
+    // Kodi 21.2 RenderManager.cpp:700-723 separates video submission from
+    // overlay rendering. mpv adaptation: playback's scalar OSD queries must
+    // not acquire the lock held across subtitle rasterization. Writers still
+    // serialize object changes with lock; readers only consume this flag.
+    atomic_bool render_subs_in_filter;
     _Atomic double force_video_pts;
 
     bool want_redraw;
-    bool want_redraw_notification;
+    atomic_bool want_redraw_notification;
 
     struct m_config_cache *opts_cache;
     struct mp_osd_render_opts *opts;
