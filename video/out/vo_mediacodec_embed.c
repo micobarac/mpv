@@ -20,6 +20,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include <limits.h>
+#include "osdep/threads.h"
 
 #include <libavcodec/mediacodec.h>
 #include <libavutil/hwcontext.h>
@@ -62,8 +64,8 @@
 // (src is into the atlas; dst is in canvas coords.)
 typedef void (*torro_subs_present_fn)(
     int32_t canvas_w, int32_t canvas_h,
-    int32_t atlas_w,  int32_t atlas_h,
-    const uint8_t *atlas_bgra,  // tight rows, stride = atlas_w * 4
+    int32_t atlas_w,  int32_t atlas_h, int32_t atlas_stride,
+    const uint8_t *atlas_bgra,  // borrowed through this synchronous callback
     int32_t num_parts,
     const int32_t *parts);
 typedef void (*torro_subs_clear_fn)(void);
@@ -80,6 +82,7 @@ typedef void (*torro_subs_clear_fn)(void);
 
 static torro_subs_present_fn g_subs_present;
 static torro_subs_clear_fn   g_subs_clear;
+static torro_subs_clear_fn   g_subs_invalidate;
 
 // SubtitleView's on-screen pixel dimensions. Rust pushes via the
 // exported `torro_set_subtitle_canvas` setter when Kotlin's
@@ -98,14 +101,17 @@ static atomic_int g_canvas_h;
 __attribute__((visibility("default")))
 void torro_register_subtitle_callbacks(
     torro_subs_present_fn present,
-    torro_subs_clear_fn   clear);
+    torro_subs_clear_fn   clear,
+    torro_subs_clear_fn   invalidate);
 
 void torro_register_subtitle_callbacks(
     torro_subs_present_fn present,
-    torro_subs_clear_fn   clear)
+    torro_subs_clear_fn   clear,
+    torro_subs_clear_fn   invalidate)
 {
     g_subs_present = present;
     g_subs_clear   = clear;
+    g_subs_invalidate = invalidate;
 }
 
 __attribute__((visibility("default")))
@@ -117,33 +123,48 @@ void torro_set_subtitle_canvas(int width, int height)
     atomic_store(&g_canvas_h, height > 0 ? height : 0);
 }
 
+// BEGIN SUBTITLE WORKER TYPES
+struct subtitle_request {
+    double pts;
+    struct mp_osd_res res;
+    uint64_t epoch;
+};
+
+struct subtitle_worker {
+    mp_thread thread;
+    mp_mutex lock;          // metadata only; never held while rendering/copying
+    mp_mutex publish_lock;  // serializes publication with reset, not video release
+    mp_cond wakeup;
+    bool started, stop, pending, have_request;
+    uint64_t epoch;
+    struct subtitle_request request;
+};
+// END SUBTITLE WORKER TYPES
+
 struct priv {
     struct mp_image *next_image;
     struct mp_hwdec_ctx hwctx;
 
-    // `sub_bitmaps.change_id` from mpv (`sub/osd.h:83`) — mpv keeps
-    // this constant frame-over-frame when the rendered subtitle
-    // image is unchanged. That's the "libass changed=0 fast path":
-    // when it matches `last_change_id`, we skip the JNI push entirely
-    // — the SubtitleView already shows the right frame.
-    int last_change_id;
-    // True iff the SubtitleView currently has a non-empty frame.
-    // Used to debounce subtitle-clear calls: we only emit
-    // a clear when subs *were* showing and now aren't.
-    bool last_had_subs;
-    // Per-flip flag set inside the bitmap callback. If osd_draw
-    // returns without invoking the callback (mpv emits no bitmaps
-    // because there's nothing to render this frame), and we *did*
-    // have subs on the previous flip, push a clear.
-    bool got_bitmaps_this_flip;
+    struct subtitle_worker subs;
     // Display time (mp_time ns) of `next_image`, from `vo_frame.pts`.
     // 0 for redraws, which release immediately.
     int64_t next_display_ns;
+    // Diagnostic timestamps only: no extra frame/pixel buffering. Kodi 21.2
+    // RendererMediaCodecSurface.cpp:107-121 and RenderManager.cpp:700-723
+    // keep Surface release and overlay rendering as distinct stages. Measure
+    // these boundaries without changing their ordering or presentation time.
+    int64_t next_draw_ns;
+    int64_t next_duration_ns;
+    int64_t last_slow_log_ns;
     // Frames handed to the compositor but not yet on screen: their
     // display time and media pts. Subtitles are rendered for the frame
     // that is on screen NOW, not the one just released 150 ms early —
-    // see flip_page. 8 slots cover the lead at any frame rate up to 50.
-    struct { int64_t display_ns; double pts; } in_flight[8];
+    // see flip_page. Kodi RendererMediaCodecSurface-21.2.cpp:107-121 and
+    // RenderManager-21.2.cpp:719-723 separate release from overlay time.
+    // mpv adaptation: 150 ms at 60 Hz needs ten pending timestamps;
+    // sixteen bounded metadata entries include the currently submitted frame.
+    // No additional codec buffers, surfaces, or presentation lead.
+    struct { int64_t display_ns; double pts; } in_flight[16];
     int in_flight_n;
     // Media pts of the frame currently on screen, -1 before the first.
     double shown_pts;
@@ -160,18 +181,6 @@ static int64_t mono_ns_for(int64_t mp_ns)
     int64_t mono_now = (int64_t)ts.tv_sec * INT64_C(1000000000) + ts.tv_nsec;
     return mono_now + (mp_ns - mp_time_ns());
 }
-
-// Reusable scratch for tight-packed atlas pixel data. Sized to the
-// largest atlas seen so far; grows monotonically (libass output
-// rarely exceeds ~512x256 even on 4K content).
-static uint8_t *g_atlas_scratch;
-static size_t   g_atlas_scratch_cap;
-
-// Reusable per-part metadata table. Capped at 256 parts — libass-via-
-// mpv typically emits 1-20 parts (one per text run) even on the most
-// complex ASS frames. 256 is comfortable headroom.
-#define MAX_PARTS 256
-static int32_t g_parts[8 * MAX_PARTS];
 
 static AVBufferRef *create_mediacodec_device_ref(struct vo *vo)
 {
@@ -190,142 +199,296 @@ static AVBufferRef *create_mediacodec_device_ref(struct vo *vo)
     return device_ref;
 }
 
-// Repack rows of `src` (with `src_stride` bytes per row) into a tight
-// `bytes_per_row * h` buffer so Kotlin's `Bitmap.copyPixelsFromBuffer`
-// gets row-aligned pixels.
-static void repack_tight(uint8_t *dst, const uint8_t *src,
-                         int src_stride, int bytes_per_row, int h)
+// BEGIN SUBTITLE WORKER FUNCTIONS
+// Kodi 21.2 RendererMediaCodecSurface.cpp:107-121 and RenderManager.cpp:702-723
+// separate video release from GUI-overlay rendering. mpv adaptation: one worker
+// performs osd_render and the synchronous Rust mailbox copy, with one pending metadata
+// request and one active bitmap list. No codec frames or future pixmaps are queued.
+static mp_static_mutex g_subtitle_registry = MP_STATIC_MUTEX_INITIALIZER;
+static struct priv *g_subtitle_active;
+
+struct subtitle_frame {
+    int w, h, stride, num_parts;
+    const uint8_t *pixels;
+    uint8_t *owned_pixels;
+    int32_t *parts;
+    size_t pixels_capacity, parts_capacity;
+};
+
+static void subtitle_frame_free(struct subtitle_frame *frame)
 {
-    if (src_stride == bytes_per_row) {
-        memcpy(dst, src, (size_t)bytes_per_row * (size_t)h);
-        return;
-    }
-    for (int y = 0; y < h; y++) {
-        memcpy(dst + (size_t)y * bytes_per_row,
-               src + (size_t)y * src_stride,
-               (size_t)bytes_per_row);
-    }
+    free(frame->owned_pixels);
+    free(frame->parts);
 }
 
-static void render_sub_bitmaps_cb(void *ctx, struct sub_bitmaps *imgs)
+// Kodi OverlayRenderer-21.2.cpp:141-157 renders every overlay in the frame.
+// Preserve primary + secondary subtitles as one presentation. The common single
+// atlas case borrows mpv's pixels/stride through the callback; Rust copies before
+// returning. Multiple atlases are stacked once, with all source rects adjusted.
+static bool subtitle_frame_prepare(struct sub_bitmap_list *list,
+                                   struct subtitle_frame *out)
 {
-    struct vo *vo = ctx;
+    size_t count = 0;
+    int width = 0, height = 0;
+    for (int i = 0; i < list->num_items; i++) {
+        struct sub_bitmaps *item = list->items[i];
+        if (item->format != SUBBITMAP_BGRA || !item->packed ||
+            item->num_parts < 0 || item->packed_w <= 0 || item->packed_h <= 0 ||
+            item->packed_w > INT_MAX / 4 ||
+            item->packed->stride[0] < item->packed_w * 4 ||
+            height > INT_MAX - item->packed_h ||
+            count > INT_MAX - item->num_parts)
+            return false;
+        width = MPMAX(width, item->packed_w);
+        height += item->packed_h;
+        count += item->num_parts;
+    }
+    if (!count || count > SIZE_MAX / (8 * sizeof(int32_t)))
+        return false;
+    // Kodi OverlayRenderer-21.2.cpp:510-535 reuses render resources. Keep one
+    // worker-owned metadata allocation and (only for multiple atlases) scratch;
+    // capacity grows to the largest required byte count, never per-cue history.
+    if (count > out->parts_capacity) {
+        int32_t *parts = realloc(out->parts, count * 8 * sizeof(int32_t));
+        if (!parts)
+            return false;
+        out->parts = parts;
+        out->parts_capacity = count;
+    }
+    out->w = width;
+    out->h = height;
+    out->num_parts = count;
+    if (list->num_items == 1) {
+        out->stride = list->items[0]->packed->stride[0];
+        out->pixels = list->items[0]->packed->planes[0];
+    } else {
+        out->stride = width * 4;
+        if ((size_t)height > SIZE_MAX / out->stride)
+            return false;
+        size_t bytes = (size_t)height * out->stride;
+        if (bytes > out->pixels_capacity) {
+            uint8_t *pixels = realloc(out->owned_pixels, bytes);
+            if (!pixels)
+                return false;
+            out->owned_pixels = pixels;
+            out->pixels_capacity = bytes;
+        }
+        // Clear this atlas footprint, including unused row tails between items.
+        memset(out->owned_pixels, 0, bytes);
+        out->pixels = out->owned_pixels;
+    }
+    int y = 0, n = 0;
+    for (int i = 0; i < list->num_items; i++) {
+        struct sub_bitmaps *item = list->items[i];
+        if (list->num_items > 1) {
+            for (int row = 0; row < item->packed_h; row++)
+                memcpy(out->owned_pixels + (size_t)(y + row) * out->stride,
+                       item->packed->planes[0] + (size_t)row * item->packed->stride[0],
+                       (size_t)item->packed_w * 4);
+        }
+        for (int j = 0; j < item->num_parts; j++) {
+            struct sub_bitmap *part = &item->parts[j];
+            if (part->src_x < 0 || part->src_y < 0 || part->w < 0 || part->h < 0 ||
+                part->src_x > item->packed_w - part->w ||
+                part->src_y > item->packed_h - part->h)
+                return false;
+            int32_t *r = &out->parts[(size_t)n++ * 8];
+            r[0] = part->src_x; r[1] = part->src_y + y;
+            r[2] = part->w; r[3] = part->h;
+            r[4] = part->x; r[5] = part->y;
+            r[6] = part->dw; r[7] = part->dh;
+        }
+        y += item->packed_h;
+    }
+    return true;
+}
+
+static MP_THREAD_VOID subtitle_thread(void *arg)
+{
+    struct vo *vo = arg;
     struct priv *p = vo->priv;
-    p->got_bitmaps_this_flip = true;
-
-    // libass / mpv `changed=0` fast path. `change_id` is incremented
-    // by mpv only when the rendered subtitle picture actually
-    // differs from the previous frame (`sub/osd.h:83`). Matching
-    // change_id means the SubtitleView's existing atlas + parts are
-    // still valid — push nothing.
-    if (imgs->change_id == p->last_change_id)
-        return;
-    p->last_change_id = imgs->change_id;
-
-    if (imgs->num_parts == 0 || imgs->format != SUBBITMAP_BGRA ||
-        !imgs->packed)
-    {
-        if (p->last_had_subs) {
-            if (g_subs_clear) g_subs_clear();
-            p->last_had_subs = false;
+    struct subtitle_worker *worker = &p->subs;
+    mp_thread_set_name("torro/subs");
+    uint64_t cached_epoch = 0;
+    int64_t last_change_id = 0;
+    bool last_had_subs = false;
+    struct subtitle_frame frame = {0};
+    while (true) {
+        mp_mutex_lock(&worker->lock);
+        while (!worker->pending && !worker->stop)
+            mp_cond_wait(&worker->wakeup, &worker->lock);
+        if (worker->stop) {
+            mp_mutex_unlock(&worker->lock);
+            break;
         }
-        return;
-    }
+        struct subtitle_request request = worker->request;
+        worker->pending = false;
+        mp_mutex_unlock(&worker->lock);
 
-    int aw = imgs->packed_w;
-    int ah = imgs->packed_h;
-    int row_bytes = aw * 4;  // SUBBITMAP_BGRA = 4 bpp premultiplied
-    size_t need = (size_t)row_bytes * (size_t)ah;
-    if (need > g_atlas_scratch_cap) {
-        free(g_atlas_scratch);
-        g_atlas_scratch = malloc(need);
-        g_atlas_scratch_cap = g_atlas_scratch ? need : 0;
-        if (!g_atlas_scratch) {
-            MP_ERR(vo, "torro-subs: OOM allocating %zu-byte atlas scratch\n", need);
-            return;
+        // mpv sub/osd.c:360-427 serializes renderer/decoder access and returns
+        // an owned list. Never borrow vo->params: vo.c:604-613 replaces it before
+        // reconfig. The request carries the exact canvas used for this render.
+        bool formats[SUBBITMAP_COUNT] = { [SUBBITMAP_BGRA] = true };
+        struct sub_bitmap_list *list = osd_render(vo->osd, request.res,
+                                                 request.pts, OSD_DRAW_SUB_ONLY,
+                                                 formats);
+        if (!list)
+            continue;
+        // Kodi OverlayRenderer-21.2.cpp:510-535: reuse unchanged images. mpv's
+        // list-level id (sub/osd.h:99-111) also tracks disappearing secondaries.
+        if (cached_epoch == request.epoch && last_change_id == list->change_id) {
+            talloc_free(list);
+            continue;
         }
+        bool empty = list->num_items == 0;
+        bool ready = empty || subtitle_frame_prepare(list, &frame);
+        mp_mutex_lock(&worker->publish_lock);
+        mp_mutex_lock(&worker->lock);
+        bool current = !worker->stop && request.epoch == worker->epoch;
+        mp_mutex_unlock(&worker->lock);
+        if (ready && current) {
+            bool submitted = false;
+            if (empty) {
+                if (g_subs_clear && (last_had_subs || cached_epoch != request.epoch))
+                    g_subs_clear();
+                submitted = true;
+            } else if (g_subs_present) {
+                g_subs_present(list->w, list->h, frame.w, frame.h, frame.stride,
+                               frame.pixels, frame.num_parts, frame.parts);
+                submitted = true;
+            }
+            if (submitted) {
+                cached_epoch = request.epoch;
+                last_change_id = list->change_id;
+                last_had_subs = !empty;
+            }
+        }
+        mp_mutex_unlock(&worker->publish_lock);
+        talloc_free(list);
     }
-    repack_tight(g_atlas_scratch, imgs->packed->planes[0],
-                 imgs->packed->stride[0], row_bytes, ah);
-
-    int n = imgs->num_parts;
-    if (n > MAX_PARTS) {
-        MP_WARN(vo, "torro-subs: %d parts exceeds MAX_PARTS=%d, truncating\n",
-                n, MAX_PARTS);
-        n = MAX_PARTS;
-    }
-    for (int i = 0; i < n; i++) {
-        struct sub_bitmap *b = &imgs->parts[i];
-        int32_t *r = &g_parts[i * 8];
-        r[0] = b->src_x;
-        r[1] = b->src_y;
-        r[2] = b->w;
-        r[3] = b->h;
-        r[4] = b->x;
-        r[5] = b->y;
-        r[6] = b->dw;
-        r[7] = b->dh;
-    }
-
-    // Canvas dimensions: SubtitleView's on-screen pixel size (pushed
-    // from Kotlin via `torro_set_subtitle_canvas` in `onSizeChanged`).
-    // This is the same coordinate space `emit_subs` handed to mpv as
-    // the OSD canvas. Fall back to source frame dims if Kotlin hasn't
-    // reported yet — keeps the first frame from rendering on a zero
-    // canvas while remaining harmlessly under-sized.
-    int cw = atomic_load(&g_canvas_w);
-    int ch = atomic_load(&g_canvas_h);
-    if (cw <= 0 || ch <= 0) {
-        cw = vo->params ? vo->params->w : aw;
-        ch = vo->params ? vo->params->h : ah;
-    }
-
-    if (g_subs_present)
-        g_subs_present(cw, ch, aw, ah, g_atlas_scratch, n, g_parts);
-    p->last_had_subs = true;
+    subtitle_frame_free(&frame);
+    MP_THREAD_RETURN();
 }
 
-static void emit_subs(struct vo *vo, double pts)
+static bool subtitle_worker_start(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+    struct subtitle_worker *worker = &p->subs;
+    if (mp_mutex_init(&worker->lock))
+        return false;
+    if (mp_mutex_init(&worker->publish_lock)) {
+        mp_mutex_destroy(&worker->lock);
+        return false;
+    }
+    if (mp_cond_init(&worker->wakeup)) {
+        mp_mutex_destroy(&worker->publish_lock);
+        mp_mutex_destroy(&worker->lock);
+        return false;
+    }
+    worker->epoch = 1;
+    if (mp_thread_create(&worker->thread, subtitle_thread, vo)) {
+        mp_cond_destroy(&worker->wakeup);
+        mp_mutex_destroy(&worker->publish_lock);
+        mp_mutex_destroy(&worker->lock);
+        return false;
+    }
+    worker->started = true;
+    mp_mutex_lock(&g_subtitle_registry);
+    g_subtitle_active = p;
+    mp_mutex_unlock(&g_subtitle_registry);
+    return true;
+}
+
+static void subtitle_submit(struct vo *vo, double pts)
 {
     struct priv *p = vo->priv;
     if (!vo->params)
         return;
-
-    // OSD canvas = SubtitleView's on-screen pixel size (Kotlin
-    // pushes via `torro_set_subtitle_canvas`). Matters because
-    // mpv's `sub-font-size` scales as `size * canvas_h / 720` and
-    // `sub-pos` is canvas-relative — using the source frame size
-    // would render fonts at source-pixel scale (much smaller on
-    // 4K displays where source is 1080p) and leave sub-pos at
-    // unintended on-screen positions. Fall back to source frame
-    // dims if Kotlin hasn't reported yet (rare race on first frame).
-    int cw = atomic_load(&g_canvas_w);
-    int ch = atomic_load(&g_canvas_h);
+    int cw = atomic_load(&g_canvas_w), ch = atomic_load(&g_canvas_h);
     if (cw <= 0 || ch <= 0) {
         cw = vo->params->w;
         ch = vo->params->h;
     }
-    struct mp_osd_res res = {
-        .w = cw,
-        .h = ch,
-        .display_par = 1.0,
-    };
-    bool formats[SUBBITMAP_COUNT] = {0};
-    formats[SUBBITMAP_BGRA] = true;  // mpv converts libass → premul BGRA
-
-    p->got_bitmaps_this_flip = false;
-    osd_draw(vo->osd, res, pts, OSD_DRAW_SUB_ONLY,
-             formats, render_sub_bitmaps_cb, vo);
-
-    if (!p->got_bitmaps_this_flip && p->last_had_subs) {
-        // osd_draw chose not to invoke the callback (no subs to
-        // render). Clear the SubtitleView so the previous frame's
-        // text doesn't stay on screen.
-        if (g_subs_clear) g_subs_clear();
-        p->last_had_subs = false;
-        p->last_change_id = 0;
+    struct subtitle_worker *worker = &p->subs;
+    mp_mutex_lock(&worker->lock);
+    if (!worker->stop) {
+        worker->request = (struct subtitle_request){
+            .pts = pts, .res = {.w = cw, .h = ch, .display_par = 1.0},
+            .epoch = worker->epoch,
+        };
+        worker->pending = worker->have_request = true;
+        mp_cond_signal(&worker->wakeup);
     }
+    mp_mutex_unlock(&worker->lock);
 }
+
+// Kodi OverlayRenderer-21.2.cpp:85-111 flushes overlays/cache together. Epoch
+// fencing prevents an in-progress old rasterization from resurrecting a clear.
+// Only reset/option changes wait on publication; ordinary video releases do not.
+static void subtitle_invalidate_request(struct priv *p, bool redraw)
+{
+    struct subtitle_worker *worker = &p->subs;
+    mp_mutex_lock(&worker->publish_lock);
+    mp_mutex_lock(&worker->lock);
+    worker->epoch++;
+    worker->pending = redraw && worker->have_request && !worker->stop;
+    worker->request.epoch = worker->epoch;
+    if (!redraw)
+        worker->have_request = false;
+    mp_cond_signal(&worker->wakeup);
+    mp_mutex_unlock(&worker->lock);
+    // The bridge also fences already queued Android presentations by generation.
+    if (g_subs_invalidate)
+        g_subs_invalidate();
+    else if (g_subs_clear)
+        g_subs_clear();
+    mp_mutex_unlock(&worker->publish_lock);
+}
+
+static void subtitle_invalidate(struct priv *p)
+{
+    subtitle_invalidate_request(p, false);
+}
+
+// Called after subtitle track/style/visibility commands. Registry ownership
+// fences VO teardown; render never needs this mutex or reenters the player API.
+__attribute__((visibility("default")))
+void torro_invalidate_subtitles(void);
+void torro_invalidate_subtitles(void)
+{
+    mp_mutex_lock(&g_subtitle_registry);
+    if (g_subtitle_active)
+        subtitle_invalidate_request(g_subtitle_active, true);
+    mp_mutex_unlock(&g_subtitle_registry);
+}
+
+static void subtitle_worker_stop(struct priv *p)
+{
+    struct subtitle_worker *worker = &p->subs;
+    if (!worker->started)
+        return;
+    mp_mutex_lock(&g_subtitle_registry);
+    if (g_subtitle_active == p)
+        g_subtitle_active = NULL;
+    mp_mutex_unlock(&g_subtitle_registry);
+    // Serialize final publication with stop, then join without holding locks.
+    mp_mutex_lock(&worker->publish_lock);
+    mp_mutex_lock(&worker->lock);
+    worker->stop = true;
+    worker->pending = false;
+    worker->epoch++;
+    mp_cond_signal(&worker->wakeup);
+    mp_mutex_unlock(&worker->lock);
+    mp_mutex_unlock(&worker->publish_lock);
+    mp_thread_join(worker->thread);
+    if (g_subs_clear)
+        g_subs_clear();
+    mp_cond_destroy(&worker->wakeup);
+    mp_mutex_destroy(&worker->publish_lock);
+    mp_mutex_destroy(&worker->lock);
+    worker->started = false;
+}
+// END SUBTITLE WORKER FUNCTIONS
 
 // The frame on screen now is the newest in-flight frame whose display
 // time has passed. Drops everything older than it.
@@ -351,8 +514,6 @@ static bool advance_shown_frame(struct priv *p)
 static int preinit(struct vo *vo)
 {
     struct priv *p = vo->priv;
-    p->last_change_id = 0;
-    p->last_had_subs = false;
     p->in_flight_n = 0;
     p->shown_pts = -1;
 
@@ -368,6 +529,11 @@ static int preinit(struct vo *vo)
         return -1;
     }
 
+    if (!subtitle_worker_start(vo)) {
+        MP_ERR(vo, "Could not start subtitle renderer\n");
+        av_buffer_unref(&p->hwctx.av_device_ref);
+        return -1;
+    }
     hwdec_devices_add(vo->hwdec_devs, &p->hwctx);
     // vo.c calls draw_frame + flip_page this much before each frame's
     // display time (`flip_queue_offset`, video/out/vo.c); flip_page
@@ -379,13 +545,24 @@ static int preinit(struct vo *vo)
 static void flip_page(struct vo *vo)
 {
     struct priv *p = vo->priv;
+    int64_t flip_start_ns = mp_time_ns();
+    int64_t release_done_ns = flip_start_ns;
+    bool timed_frame = p->next_image && p->next_display_ns > 0 &&
+                       p->next_duration_ns > 0;
+    double media_pts = p->next_image ? p->next_image->pts : MP_NOPTS_VALUE;
     if (p->next_image) {
         AVMediaCodecBuffer *buffer = (AVMediaCodecBuffer *)p->next_image->planes[3];
         if (p->next_display_ns > 0) {
             av_mediacodec_render_buffer_at_time(buffer, mono_ns_for(p->next_display_ns));
+            // Consume due timestamps before retaining the new future frame.
+            advance_shown_frame(p);
+            if (p->in_flight_n && p->next_display_ns <=
+                p->in_flight[p->in_flight_n - 1].display_ns)
+                p->in_flight_n = 0; // seek/discontinuous presentation clock
             if (p->in_flight_n == MP_ARRAY_SIZE(p->in_flight)) {
-                memmove(p->in_flight, p->in_flight + 1,
-                        (p->in_flight_n - 1) * sizeof(p->in_flight[0]));
+                // Saturation outside supported cadence: retain the earliest
+                // future frames so the subtitle clock cannot starve; replace
+                // only the furthest future timestamp. Memory remains bounded.
                 p->in_flight_n--;
             }
             p->in_flight[p->in_flight_n].display_ns = p->next_display_ns;
@@ -397,20 +574,52 @@ static void flip_page(struct vo *vo)
             p->shown_pts = p->next_image->pts;
             p->in_flight_n = 0;
         }
+        release_done_ns = mp_time_ns();
         mp_image_unrefp(&p->next_image);
     }
+    int64_t subs_start_ns = mp_time_ns();
     // Subtitles follow the frame on screen, not the one just queued
     // TORRO_EARLY_RELEASE_NS ahead: rendered for its pts and pushed
-    // immediately, so they are on time within one frame and never
-    // depend on the Android main thread.
+    // asynchronously; only bounded metadata crosses to the subtitle worker.
+    // Rasterization and Rust mailbox copying cannot hold this release iteration.
     advance_shown_frame(p);
     if (p->shown_pts >= 0)
-        emit_subs(vo, p->shown_pts);
+        subtitle_submit(vo, p->shown_pts);
+
+    // Kodi 21.2 RenderManager.cpp:700-723: diagnose the video and overlay
+    // stages separately. This probe does not claim that a late arrival was
+    // caused by subtitles: ready_late measures arrival at draw_frame, while
+    // flip_late includes the VO wait/scheduling interval. Only warn if a
+    // frame interval was consumed; cap logging at once per second so a burst
+    // of late frames does not itself flood the playback thread with logs.
+    int64_t done_ns = mp_time_ns();
+    int64_t queue_ns = p->next_display_ns - TORRO_EARLY_RELEASE_NS;
+    if (timed_frame &&
+        (done_ns - flip_start_ns > p->next_duration_ns ||
+         flip_start_ns - queue_ns > p->next_duration_ns) &&
+        (!p->last_slow_log_ns ||
+         done_ns - p->last_slow_log_ns >= MP_TIME_S_TO_NS(1)))
+    {
+        p->last_slow_log_ns = done_ns;
+        MP_WARN(vo, "torro-vo-late: pts=%.3f frame_ms=%.3f "
+                "ready_late_ms=%.3f flip_late_ms=%.3f release_ms=%.3f "
+                "unref_ms=%.3f subs_ms=%.3f\n",
+                media_pts, MP_TIME_NS_TO_MS(p->next_duration_ns),
+                MP_TIME_NS_TO_MS(p->next_draw_ns - queue_ns),
+                MP_TIME_NS_TO_MS(flip_start_ns - queue_ns),
+                MP_TIME_NS_TO_MS(release_done_ns - flip_start_ns),
+                MP_TIME_NS_TO_MS(subs_start_ns - release_done_ns),
+                MP_TIME_NS_TO_MS(done_ns - subs_start_ns));
+    }
 }
 
 static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct priv *p = vo->priv;
+    // Kodi 21.2 RendererMediaCodecSurface.cpp:95-104: record frame arrival
+    // separately from the later Surface release; timing only, no queue change.
+    p->next_draw_ns = mp_time_ns();
+    p->next_duration_ns = frame->duration;
 
     mp_image_t *mpi = NULL;
     if (!frame->redraw && !frame->repeat)
@@ -436,6 +645,7 @@ static int control(struct vo *vo, uint32_t request, void *data)
         // Seek / flush: the queued frames will never be shown.
         p->in_flight_n = 0;
         p->shown_pts = -1;
+        subtitle_invalidate(p);
         return VO_TRUE;
     }
     return VO_NOTIMPL;
@@ -446,7 +656,7 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     // Force a fresh push on the next frame so the SubtitleView gets
     // the canvas dimensions for the new video params.
     struct priv *p = vo->priv;
-    p->last_change_id = 0;
+    subtitle_invalidate(p);
     return 0;
 }
 
@@ -454,7 +664,7 @@ static void uninit(struct vo *vo)
 {
     struct priv *p = vo->priv;
     mp_image_unrefp(&p->next_image);
-    if (g_subs_clear) g_subs_clear();
+    subtitle_worker_stop(p);
 
     hwdec_devices_remove(vo->hwdec_devs, &p->hwctx);
     av_buffer_unref(&p->hwctx.av_device_ref);
