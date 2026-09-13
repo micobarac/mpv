@@ -22,6 +22,8 @@
 #include <assert.h>
 #include <dlfcn.h>
 #include <stdint.h>
+#include <stdatomic.h>
+#include <time.h>
 
 #include <aaudio/AAudio.h>
 #include <android/api-level.h>
@@ -42,8 +44,17 @@ struct priv {
     int32_t buffer_capacity;
     aaudio_performance_mode_t performance_mode;
 
-    int64_t presented;
-    int64_t discarded;
+    _Atomic int64_t presented;
+    _Atomic int64_t discarded;
+
+    // Control publishes a new monotonic epoch before starting audio; only the
+    // callback owns the cached timestamp. No allocation or callback-side lock.
+    _Atomic int64_t timestamp_epoch;
+    _Atomic int64_t reset_epoch;
+    _Atomic int64_t paused_duration;
+    int64_t pause_started; // control thread only
+    int64_t callback_epoch;
+    int64_t presented_time;
 
     int device_api;
     void *lib_handle;
@@ -225,6 +236,13 @@ static void error_callback(AAudioStream *stream, void *context, aaudio_result_t 
     ao_request_reload(ao);
 }
 
+static int64_t monotonic_time_ns(void)
+{
+    struct timespec ts = {0};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return MP_TIME_S_TO_NS(ts.tv_sec) + ts.tv_nsec;
+}
+
 static aaudio_data_callback_result_t data_callback(AAudioStream *stream, void *context,
                                                    void *data, int32_t nframes)
 {
@@ -234,18 +252,45 @@ static aaudio_data_callback_result_t data_callback(AAudioStream *stream, void *c
     aaudio_result_t result;
     int64_t presented, present_time;
     int64_t written = p->AAudioStream_getFramesWritten(stream);
-
-    if ((result = p->AAudioStream_getTimestamp(stream, CLOCK_MONOTONIC, &presented, &present_time)) < 0) {
-        MP_TRACE(ao, "AAudioStream_getTimestamp() returned %s\n",
-                 p->AAudio_convertResultToText(result));
-        presented = p->presented;
-    } else {
-        p->presented = presented;
+    int64_t epoch = atomic_load(&p->timestamp_epoch);
+    if (epoch != p->callback_epoch) {
+        if (atomic_load(&p->reset_epoch) > p->callback_epoch)
+            p->presented_time = 0;
+        p->callback_epoch = epoch;
     }
 
-    int64_t end_time = mp_time_ns();
-    end_time += MP_TIME_S_TO_NS(nframes) / ao->samplerate;
-    end_time += MP_TIME_S_TO_NS(written - (presented + p->discarded)) / ao->samplerate;
+    result = p->AAudioStream_getTimestamp(stream, CLOCK_MONOTONIC,
+                                         &presented, &present_time);
+    int64_t now = monotonic_time_ns();
+    int64_t paused_duration = atomic_load(&p->paused_duration);
+    if (result < 0) {
+        MP_TRACE(ao, "AAudioStream_getTimestamp() returned %s\n",
+                 p->AAudio_convertResultToText(result));
+    } else if (presented >= 0 && presented <= written &&
+               present_time > 0 && present_time >= epoch && present_time <= now) {
+        p->presented = presented;
+        p->presented_time = present_time - paused_duration;
+    }
+
+    // Kodi 21.2 AESinkAUDIOTRACK.cpp:703-741 advances the timestamp's
+    // frame position by elapsed monotonic time; :675-681 bounds consumed
+    // output. AAudio supplies the same position/time pair. A failed query
+    // retains that pair, not a frozen position dated as if it were new.
+    // Keep the cached timestamp in active-playback time. Subtract only paused
+    // wall time on resume, preserving extrapolation already consumed before
+    // pause even when timestamp queries fail across multiple pause cycles.
+    // Before the first valid timestamp, anchor the existing position once.
+    int64_t active_now = now - paused_duration;
+    if (!p->presented_time)
+        p->presented_time = active_now;
+    int64_t pending = written - (atomic_load(&p->presented) +
+                                 atomic_load(&p->discarded));
+    int64_t delay = MP_TIME_S_TO_NS(MPMAX(pending, 0)) / ao->samplerate;
+    delay = MPMAX(delay - MPMAX(active_now - p->presented_time, 0), 0);
+    // mpv may use MONOTONIC_RAW with a different epoch. Convert the remaining
+    // duration, never an absolute CLOCK_MONOTONIC timestamp, to its clock.
+    int64_t end_time = mp_time_ns() + delay +
+                       MP_TIME_S_TO_NS(nframes) / ao->samplerate;
 
     ao_read_data(ao, &data, nframes, end_time, NULL, true, true);
 
@@ -408,9 +453,17 @@ static void start(struct ao *ao)
     // small, the video looked late by the same amount and was dropped
     // frame after frame on a real-time-paced decoder.
     aaudio_stream_state_t state = p->AAudioStream_getState(p->stream);
-    if (state != AAUDIO_STREAM_STATE_PAUSED && state != AAUDIO_STREAM_STATE_PAUSING)
+    int64_t now = monotonic_time_ns();
+    if (state != AAUDIO_STREAM_STATE_PAUSED && state != AAUDIO_STREAM_STATE_PAUSING) {
         p->discarded = p->AAudioStream_getFramesWritten(p->stream) - p->presented;
-
+        // Kodi AESinkAUDIOTRACK.cpp:988-1008 resets timestamp state on drain.
+        atomic_store(&p->reset_epoch, now);
+    }
+    if (p->pause_started) {
+        atomic_fetch_add(&p->paused_duration, now - p->pause_started);
+        p->pause_started = 0;
+    }
+    atomic_store(&p->timestamp_epoch, now);
     if ((result = p->AAudioStream_requestStart(p->stream)) < 0) {
         MP_ERR(ao, "AAudioStream_requestStart() returned %s\n",
                p->AAudio_convertResultToText(result));
@@ -422,6 +475,17 @@ static bool set_pause(struct ao *ao, bool paused)
 {
     struct priv *p = ao->priv;
 
+    int64_t now = monotonic_time_ns();
+    if (paused) {
+        if (!p->pause_started)
+            p->pause_started = now;
+    } else {
+        if (p->pause_started) {
+            atomic_fetch_add(&p->paused_duration, now - p->pause_started);
+            p->pause_started = 0;
+        }
+        atomic_store(&p->timestamp_epoch, now);
+    }
     aaudio_result_t result = paused
                     ? p->AAudioStream_requestPause(p->stream)
                     : p->AAudioStream_requestStart(p->stream);
