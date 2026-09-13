@@ -193,10 +193,13 @@ static_assert(MP_ARRAY_SIZE(aaudio_chmaps) == MP_ARRAY_SIZE(aaudio_masks),
  */
 static const uint8_t aaudio_max_chnums[] = {
     MP_ARRAY_SIZE(aaudio_chmaps),
-    22, /* FCC_12 */
-    19, /* FCC_8  */
-    2,  /* FCC_2  */
-    1   /* FCC_1  */
+    // Kodi 21.2 AESinkAUDIOTRACK.cpp:564-596 retries supported layouts before
+    // failing. These are exclusive map counts: include the last valid layout
+    // for each Android channel limit, including stereo and mono.
+    23, /* FCC_12: through 7.1.4 */
+    20, /* FCC_8: through 5.1.2 */
+    3,  /* FCC_2: through stereo */
+    2   /* FCC_1: through mono */
 };
 
 static bool load_lib_functions(struct ao *ao)
@@ -404,7 +407,9 @@ static int init(struct ao *ao)
             if (result != AAUDIO_ERROR_OUT_OF_RANGE) {
                 break;
             }
-        } while (i++ < MP_ARRAY_SIZE(aaudio_max_chnums));
+        // Kodi AESinkAUDIOTRACK.cpp:594-596 fails after supported fallbacks;
+        // test the next index before accessing another candidate.
+        } while (++i < MP_ARRAY_SIZE(aaudio_max_chnums));
 
         ao->channels = channels;
     } else {
