@@ -342,11 +342,10 @@ static bool update_pkt_cache(struct dec_sub *sub, double video_pts)
 // enough packets were read and if the subtitle state updated in anyway. If
 // packets_read is false, the player should wait until the demuxer signals new
 // packets and retry.
-void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
+static void sub_read_packets_locked(struct dec_sub *sub, double video_pts, bool force,
                       bool *packets_read, bool *sub_updated)
 {
     *packets_read = true;
-    mp_mutex_lock(&sub->lock);
     video_pts = pts_to_subtitle(sub, video_pts);
     while (1) {
         bool read_more = true;
@@ -402,6 +401,13 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
         *sub_updated = update_pkt_cache(sub, video_pts) || sub->sub_visible != visible;
         sub->sub_visible = visible;
     }
+}
+
+void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
+                      bool *packets_read, bool *sub_updated)
+{
+    mp_mutex_lock(&sub->lock);
+    sub_read_packets_locked(sub, video_pts, force, packets_read, sub_updated);
     mp_mutex_unlock(&sub->lock);
 }
 
@@ -508,10 +514,9 @@ void sub_select(struct dec_sub *sub, bool selected)
     mp_mutex_unlock(&sub->lock);
 }
 
-int sub_control(struct dec_sub *sub, enum sd_ctrl cmd, void *arg)
+static int sub_control_locked(struct dec_sub *sub, enum sd_ctrl cmd, void *arg)
 {
     int r = CONTROL_UNKNOWN;
-    mp_mutex_lock(&sub->lock);
     bool propagate = false;
     switch (cmd) {
     case SD_CTRL_SET_VIDEO_DEF_FPS:
@@ -547,8 +552,43 @@ int sub_control(struct dec_sub *sub, enum sd_ctrl cmd, void *arg)
     }
     if (propagate && sub->sd->driver->control)
         r = sub->sd->driver->control(sub->sd, cmd, arg);
+    return r;
+}
+
+int sub_control(struct dec_sub *sub, enum sd_ctrl cmd, void *arg)
+{
+    mp_mutex_lock(&sub->lock);
+    int r = sub_control_locked(sub, cmd, arg);
     mp_mutex_unlock(&sub->lock);
     return r;
+}
+
+// Kodi 21.2 RenderManager.cpp:700-723 presents video separately from GUI
+// overlays; VideoPlayerSubtitle.cpp:40-60 queues decoded overlays. Our native
+// bitmap worker must likewise never hold up a running video frame. Keep the
+// decoder lock and its packets intact: if rasterization owns it, retry the
+// update on the next playback iteration. No dropped packets or new queue.
+// Return false only when the caller must perform the initial file preload.
+bool sub_try_update_video(struct dec_sub *sub, double video_pts,
+                          struct mp_image_params *params, bool fully_read,
+                          bool *packets_read)
+{
+    *packets_read = true;
+    if (mp_mutex_trylock(&sub->lock))
+        return true;
+    if (fully_read && sub->sd->driver->accept_packets_in_advance &&
+        !sub->preload_attempted) {
+        mp_mutex_unlock(&sub->lock);
+        return false;
+    }
+    if (params->imgfmt)
+        sub_control_locked(sub, SD_CTRL_SET_VIDEO_PARAMS, params);
+    bool animated = false;
+    sub_control_locked(sub, SD_CTRL_SET_ANIMATED_CHECK, &animated);
+    bool updated = false;
+    sub_read_packets_locked(sub, video_pts, false, packets_read, &updated);
+    mp_mutex_unlock(&sub->lock);
+    return true;
 }
 
 void sub_set_recorder_sink(struct dec_sub *sub, struct mp_recorder_sink *sink)

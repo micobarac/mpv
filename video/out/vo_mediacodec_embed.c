@@ -149,13 +149,6 @@ struct priv {
     // Display time (mp_time ns) of `next_image`, from `vo_frame.pts`.
     // 0 for redraws, which release immediately.
     int64_t next_display_ns;
-    // Diagnostic timestamps only: no extra frame/pixel buffering. Kodi 21.2
-    // RendererMediaCodecSurface.cpp:107-121 and RenderManager.cpp:700-723
-    // keep Surface release and overlay rendering as distinct stages. Measure
-    // these boundaries without changing their ordering or presentation time.
-    int64_t next_draw_ns;
-    int64_t next_duration_ns;
-    int64_t last_slow_log_ns;
     // Frames handed to the compositor but not yet on screen: their
     // display time and media pts. Subtitles are rendered for the frame
     // that is on screen NOW, not the one just released 150 ms early —
@@ -545,11 +538,6 @@ static int preinit(struct vo *vo)
 static void flip_page(struct vo *vo)
 {
     struct priv *p = vo->priv;
-    int64_t flip_start_ns = mp_time_ns();
-    int64_t release_done_ns = flip_start_ns;
-    bool timed_frame = p->next_image && p->next_display_ns > 0 &&
-                       p->next_duration_ns > 0;
-    double media_pts = p->next_image ? p->next_image->pts : MP_NOPTS_VALUE;
     if (p->next_image) {
         AVMediaCodecBuffer *buffer = (AVMediaCodecBuffer *)p->next_image->planes[3];
         if (p->next_display_ns > 0) {
@@ -574,10 +562,8 @@ static void flip_page(struct vo *vo)
             p->shown_pts = p->next_image->pts;
             p->in_flight_n = 0;
         }
-        release_done_ns = mp_time_ns();
         mp_image_unrefp(&p->next_image);
     }
-    int64_t subs_start_ns = mp_time_ns();
     // Subtitles follow the frame on screen, not the one just queued
     // TORRO_EARLY_RELEASE_NS ahead: rendered for its pts and pushed
     // asynchronously; only bounded metadata crosses to the subtitle worker.
@@ -585,43 +571,12 @@ static void flip_page(struct vo *vo)
     advance_shown_frame(p);
     if (p->shown_pts >= 0)
         subtitle_submit(vo, p->shown_pts);
-
-    // Kodi 21.2 RenderManager.cpp:700-723: diagnose the video and overlay
-    // stages separately. This probe does not claim that a late arrival was
-    // caused by subtitles: ready_late measures arrival at draw_frame, while
-    // flip_late includes the VO wait/scheduling interval. Only warn if a
-    // frame interval was consumed; cap logging at once per second so a burst
-    // of late frames does not itself flood the playback thread with logs.
-    int64_t done_ns = mp_time_ns();
-    int64_t queue_ns = p->next_display_ns - TORRO_EARLY_RELEASE_NS;
-    if (timed_frame &&
-        (done_ns - flip_start_ns > p->next_duration_ns ||
-         flip_start_ns - queue_ns > p->next_duration_ns) &&
-        (!p->last_slow_log_ns ||
-         done_ns - p->last_slow_log_ns >= MP_TIME_S_TO_NS(1)))
-    {
-        p->last_slow_log_ns = done_ns;
-        MP_WARN(vo, "torro-vo-late: pts=%.3f frame_ms=%.3f "
-                "ready_late_ms=%.3f flip_late_ms=%.3f release_ms=%.3f "
-                "unref_ms=%.3f subs_ms=%.3f\n",
-                media_pts, MP_TIME_NS_TO_MS(p->next_duration_ns),
-                MP_TIME_NS_TO_MS(p->next_draw_ns - queue_ns),
-                MP_TIME_NS_TO_MS(flip_start_ns - queue_ns),
-                MP_TIME_NS_TO_MS(release_done_ns - flip_start_ns),
-                MP_TIME_NS_TO_MS(subs_start_ns - release_done_ns),
-                MP_TIME_NS_TO_MS(done_ns - subs_start_ns));
-    }
 }
 
 static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct priv *p = vo->priv;
-    // Kodi 21.2 RendererMediaCodecSurface.cpp:95-104: record frame arrival
-    // separately from the later Surface release; timing only, no queue change.
-    p->next_draw_ns = mp_time_ns();
-    p->next_duration_ns = frame->duration;
-
-    mp_image_t *mpi = NULL;
+    struct mp_image *mpi = NULL;
     if (!frame->redraw && !frame->repeat)
         mpi = mp_image_new_ref(frame->current);
 

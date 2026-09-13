@@ -58,6 +58,10 @@ void sub_destroy(struct dec_sub *sub);
 
 bool sub_can_preload(struct dec_sub *sub);
 void sub_preload(struct dec_sub *sub);
+// Nonblocking update for running native-video playback; see dec_sub.c.
+bool sub_try_update_video(struct dec_sub *sub, double video_pts,
+                          struct mp_image_params *params, bool fully_read,
+                          bool *packets_read);
 void sub_redecode_cached_packets(struct dec_sub *sub);
 void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
                       bool *packets_read, bool *sub_updated);

@@ -40,6 +40,7 @@
 #include "ass_mp.h"
 #include "packer.h"
 #include "sd.h"
+#include "htmlfont.h"
 
 struct sd_ass_priv {
     struct ass_library *ass_library;
@@ -387,6 +388,27 @@ static void filter_and_add(struct sd *sd, struct demux_packet *pkt)
     ass_process_chunk(ctx->ass_track, pkt->buffer, pkt->len,
                       floor(pkt->pts * 1000 + 1e-6),
                       floor(pkt->duration * 1000 + 1e-6));
+
+    // Kodi 21.2 DVDSubtitleTagSami.cpp:142-168 converts HTML font styles.
+    // Native ASS bypasses lavc, and other decoders can leave HTML in their
+    // ASS output. Normalize only newly accepted Text before animation checks.
+    // Already-converted SRT styles pass through unchanged.
+    // This runs once per cue, never in the rasterizer or video render loop.
+    for (int n = old_n_events; n < track->n_events; n++) {
+        ASS_Event *event = &track->events[n];
+        AVBPrint text;
+        av_bprint_init(&text, 0, AV_BPRINT_SIZE_UNLIMITED);
+        int converted = torro_font_ass(&text, event->Text);
+        if (converted > 0) {
+            // libass frees Text with free(), not av_free()/talloc_free().
+            char *replacement = strdup(text.str);
+            if (replacement) {
+                free(event->Text);
+                event->Text = replacement;
+            }
+        }
+        av_bprint_finalize(&text, NULL);
+    }
 
     // This bookkeeping only has any practical use for ASS subs
     // over a VO with no video.
