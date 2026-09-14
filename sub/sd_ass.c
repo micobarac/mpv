@@ -41,6 +41,7 @@
 #include "packer.h"
 #include "sd.h"
 #include "htmlfont.h"
+#include "emptylines.h"
 
 struct sd_ass_priv {
     struct ass_library *ass_library;
@@ -408,6 +409,7 @@ static void filter_and_add(struct sd *sd, struct demux_packet *pkt)
             }
         }
         av_bprint_finalize(&text, NULL);
+        torro_ass_remove_empty_lines(event->Text, track->WrapStyle, event->Effect);
     }
 
     // This bookkeeping only has any practical use for ASS subs

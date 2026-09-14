@@ -21,6 +21,7 @@
 
 #include <assert.h>
 #include <dlfcn.h>
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdatomic.h>
 #include <time.h>
@@ -55,6 +56,14 @@ struct priv {
     int64_t pause_started; // control thread only
     int64_t callback_epoch;
     int64_t presented_time;
+    // Callback-owned timestamp policy, mirroring Kodi 21.2
+    // AESinkAUDIOTRACK.cpp: query cadence (:878-892), freshness gate
+    // (:887-888) and the 3-member linear moving average (:36, :1073-1105).
+    bool stamp_valid;        // a HAL pair passed the gate since the epoch
+    int64_t stamp_next_query; // CLOCK_MONOTONIC ns; 0 queries now
+    int64_t stamp_last_warn;  // CLOCK_MONOTONIC ns of the last anomaly line
+    double delay_avg[3];
+    int delay_avg_n;
 
     int device_api;
     void *lib_handle;
@@ -260,19 +269,63 @@ static aaudio_data_callback_result_t data_callback(AAudioStream *stream, void *c
         if (atomic_load(&p->reset_epoch) > p->callback_epoch)
             p->presented_time = 0;
         p->callback_epoch = epoch;
+        // Kodi AESinkAUDIOTRACK.cpp:988-1008 drops timestamp state and the
+        // delay history on drain; a new epoch is our start/resume point.
+        p->stamp_valid = false;
+        p->stamp_next_query = 0;
+        p->delay_avg_n = 0;
     }
 
-    result = p->AAudioStream_getTimestamp(stream, CLOCK_MONOTONIC,
-                                         &presented, &present_time);
     int64_t now = monotonic_time_ns();
     int64_t paused_duration = atomic_load(&p->paused_duration);
-    if (result < 0) {
-        MP_TRACE(ao, "AAudioStream_getTimestamp() returned %s\n",
-                 p->AAudio_convertResultToText(result));
-    } else if (presented >= 0 && presented <= written &&
-               present_time > 0 && present_time >= epoch && present_time <= now) {
-        p->presented = presented;
-        p->presented_time = present_time - paused_duration;
+    // Kodi AESinkAUDIOTRACK.cpp:878-892: ask the HAL once per second while
+    // the last pair was valid, every 100 ms until one is. Upstream mpv
+    // ao_audiotrack.c:393 polls the same way (50 ms, then 3 s). Between
+    // queries the cached pair is extrapolated below.
+    if (now >= p->stamp_next_query) {
+        result = p->AAudioStream_getTimestamp(stream, CLOCK_MONOTONIC,
+                                             &presented, &present_time);
+        bool accepted = false;
+        if (result < 0) {
+            MP_TRACE(ao, "AAudioStream_getTimestamp() returned %s\n",
+                     p->AAudio_convertResultToText(result));
+        } else if (presented >= 0 && presented <= written &&
+                   present_time > 0 && present_time >= epoch &&
+                   present_time <= now &&
+                   // Kodi AESinkAUDIOTRACK.cpp:887-888: the pair's nanoTime
+                   // must be less than 50 ms old, or it is not used.
+                   now - present_time < 50 * 1000 * 1000) {
+            int64_t active_time = present_time - paused_duration;
+            if (p->stamp_valid) {
+                // Position the HAL pair implies versus the extrapolation
+                // from the previous pair (Kodi :908-914 formula). More than
+                // one 24 fps frame apart is the spurious-timestamp signature
+                // (ExoPlayer AudioTimestampPoller "frame position mismatch").
+                int64_t expected = atomic_load(&p->presented) +
+                    (active_time - p->presented_time) * ao->samplerate / MP_TIME_S_TO_NS(1);
+                int64_t dev_ms = (presented - expected) * 1000 / ao->samplerate;
+                if ((dev_ms > 40 || dev_ms < -40) &&
+                    now - p->stamp_last_warn > MP_TIME_S_TO_NS(1)) {
+                    p->stamp_last_warn = now;
+                    MP_WARN(ao, "timestamp deviates %" PRId64 " ms from extrapolation: "
+                            "presented=%" PRId64 " expected=%" PRId64 " written=%" PRId64
+                            " age_ms=%" PRId64 "\n", dev_ms, presented, expected, written,
+                            (now - present_time) / 1000000);
+                }
+            }
+            p->presented = presented;
+            p->presented_time = active_time;
+            p->stamp_valid = true;
+            accepted = true;
+        } else if (result >= 0 && p->stamp_valid &&
+                   now - p->stamp_last_warn > MP_TIME_S_TO_NS(1)) {
+            p->stamp_last_warn = now;
+            MP_WARN(ao, "timestamp rejected: presented=%" PRId64 " written=%" PRId64
+                    " age_ms=%" PRId64 "\n", presented, written,
+                    (now - present_time) / 1000000);
+        }
+        p->stamp_next_query = now + (accepted ? MP_TIME_S_TO_NS(1)
+                                              : MP_TIME_MS_TO_NS(100));
     }
 
     // Kodi 21.2 AESinkAUDIOTRACK.cpp:703-741 advances the timestamp's
@@ -290,6 +343,19 @@ static aaudio_data_callback_result_t data_callback(AAudioStream *stream, void *c
                                  atomic_load(&p->discarded));
     int64_t delay = MP_TIME_S_TO_NS(MPMAX(pending, 0)) / ao->samplerate;
     delay = MPMAX(delay - MPMAX(active_now - p->presented_time, 0), 0);
+    // Kodi AESinkAUDIOTRACK.cpp:958 + :1073-1105: the delay handed to the
+    // engine is a 3-member linear weighted moving average,
+    // m_LWMA(t) = 2/(n(n+1)) * sum_{i=1..n} i * x(t-n+i), newest weighted most.
+    if (p->delay_avg_n == (int)MP_ARRAY_SIZE(p->delay_avg)) {
+        for (int i = 1; i < p->delay_avg_n; i++)
+            p->delay_avg[i - 1] = p->delay_avg[i];
+        p->delay_avg_n--;
+    }
+    p->delay_avg[p->delay_avg_n++] = delay;
+    double avg_sum = 0.0;
+    for (int i = 0; i < p->delay_avg_n; i++)
+        avg_sum += (i + 1) * p->delay_avg[i];
+    delay = (int64_t)(avg_sum * 2.0 / (p->delay_avg_n * (p->delay_avg_n + 1)));
     // mpv may use MONOTONIC_RAW with a different epoch. Convert the remaining
     // duration, never an absolute CLOCK_MONOTONIC timestamp, to its clock.
     int64_t end_time = mp_time_ns() + delay +
