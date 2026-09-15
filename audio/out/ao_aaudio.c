@@ -21,6 +21,7 @@
 
 #include <assert.h>
 #include <dlfcn.h>
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdatomic.h>
 #include <time.h>
@@ -55,6 +56,16 @@ struct priv {
     int64_t pause_started; // control thread only
     int64_t callback_epoch;
     int64_t presented_time;
+    // Media3 AudioTrackPositionTracker port (callback-owned). `trk_pos` is
+    // the audio-time position last handed to the clock, `trk_time` the
+    // active-playback time it was handed at. `pair_*` remember the last
+    // accepted HAL pair for the rate diagnostic. All reset with the epoch.
+    bool trk_valid;
+    int64_t trk_pos, trk_time;
+    bool pair_valid;
+    int64_t pair_pos, pair_time;
+    int32_t xruns;
+    int64_t last_pair_warn, last_bound_warn;
 
     int device_api;
     void *lib_handle;
@@ -260,19 +271,57 @@ static aaudio_data_callback_result_t data_callback(AAudioStream *stream, void *c
         if (atomic_load(&p->reset_epoch) > p->callback_epoch)
             p->presented_time = 0;
         p->callback_epoch = epoch;
+        // Media3 AudioTrackPositionTracker.java:253-257 and
+        // AudioTimestampPoller.reset(): a start, resume or flush is a
+        // discontinuity; the next report is taken as is.
+        p->trk_valid = false;
+        p->pair_valid = false;
     }
 
     result = p->AAudioStream_getTimestamp(stream, CLOCK_MONOTONIC,
                                          &presented, &present_time);
     int64_t now = monotonic_time_ns();
     int64_t paused_duration = atomic_load(&p->paused_duration);
+    bool warn_ok = now - p->last_pair_warn > MP_TIME_S_TO_NS(1);
     if (result < 0) {
         MP_TRACE(ao, "AAudioStream_getTimestamp() returned %s\n",
                  p->AAudio_convertResultToText(result));
     } else if (presented >= 0 && presented <= written &&
                present_time > 0 && present_time >= epoch && present_time <= now) {
+        int64_t active_time = present_time - paused_duration;
+        // Diagnostics only. VLC clock.c:37,436-454: the rate between two
+        // clock points must stay within 0.8..1.2 of real time, or the
+        // source is not trusted. Media3 AudioTimestampPoller.java:332-339:
+        // a pair more than 5 s from the device's own read counter is
+        // spurious. Neither changes the clock here; both name the pair.
+        if (p->pair_valid && active_time > p->pair_time && warn_ok) {
+            int64_t dpos_ns = MP_TIME_S_TO_NS(presented - p->pair_pos) / ao->samplerate;
+            int64_t rate_permille = dpos_ns * 1000 / (active_time - p->pair_time);
+            if (rate_permille < 800 || rate_permille > 1200) {
+                p->last_pair_warn = now; warn_ok = false;
+                MP_WARN(ao, "timestamp rate %" PRId64 "/1000 of real time: presented=%" PRId64
+                        " prev=%" PRId64 " dt_ms=%" PRId64 "\n", rate_permille, presented,
+                        p->pair_pos, (active_time - p->pair_time) / 1000000);
+            }
+        }
+        int64_t device_read = p->AAudioStream_getFramesRead(stream);
+        int64_t read_gap = presented > device_read ? presented - device_read
+                                                   : device_read - presented;
+        if (warn_ok && read_gap > 5 * (int64_t)ao->samplerate) {
+            p->last_pair_warn = now; warn_ok = false;
+            MP_WARN(ao, "timestamp %" PRId64 " disagrees with frames read %" PRId64 "\n",
+                    presented, device_read);
+        }
+        p->pair_pos = presented;
+        p->pair_time = active_time;
+        p->pair_valid = true;
         p->presented = presented;
-        p->presented_time = present_time - paused_duration;
+        p->presented_time = active_time;
+    }
+    int32_t xruns = p->AAudioStream_getXRunCount(stream);
+    if (xruns != p->xruns) {
+        MP_WARN(ao, "device underrun count %" PRId32 " -> %" PRId32 "\n", p->xruns, xruns);
+        p->xruns = xruns;
     }
 
     // Kodi 21.2 AESinkAUDIOTRACK.cpp:703-741 advances the timestamp's
@@ -290,6 +339,61 @@ static aaudio_data_callback_result_t data_callback(AAudioStream *stream, void *c
                                  atomic_load(&p->discarded));
     int64_t delay = MP_TIME_S_TO_NS(MPMAX(pending, 0)) / ao->samplerate;
     delay = MPMAX(delay - MPMAX(active_now - p->presented_time, 0), 0);
+    // Media3 AudioTrackPositionTracker.java:268-291 (getCurrentPositionUs):
+    // the position handed to the clock may leave the previous report's
+    // prediction by at most 10 % of the elapsed time
+    // (MAX_POSITION_SMOOTHING_SPEED_CHANGE_PERCENT, :115), unless it has
+    // not moved at all (a stalled device must be seen) or is more than 1 s
+    // away (MAX_POSITION_DRIFT_FOR_SMOOTHING_US, :112: a discontinuity
+    // must be seen). player/video.c:636 copies this delay straight into
+    // the frame wait, so one spurious HAL pair otherwise becomes a burst
+    // of dropped frames followed by a hold of the same length. The
+    // position is audio time: frames written and not flushed, minus the
+    // delay. A healthy stream never leaves the window and is untouched.
+    // Tracking arms only once a HAL pair has been accepted in this epoch:
+    // until then the clock runs on the anchor, and `discarded` after a
+    // flush comes from a cached pair up to one callback old, so the first
+    // real pair after start, resume or seek carries a legitimate correction
+    // (Media3 AudioTimestampPoller: no smoothing before an accepted stamp).
+    int64_t out_ns = MP_TIME_S_TO_NS(written - atomic_load(&p->discarded)) / ao->samplerate;
+    int64_t pos = out_ns - delay;
+    if (p->trk_valid && active_now > p->trk_time && pos != p->trk_pos) {
+        int64_t elapsed = active_now - p->trk_time;
+        int64_t expected = p->trk_pos + elapsed;
+        int64_t drift = pos > expected ? pos - expected : expected - pos;
+        if (drift < MP_TIME_S_TO_NS(1)) {
+            int64_t max_drift = elapsed * 10 / 100;
+            int64_t bounded = MPCLAMP(pos, expected - max_drift, expected + max_drift);
+            if (bounded != pos) {
+                // Log only corrections the line can show: the printout is
+                // whole milliseconds, and the 10 % window trips on the HAL's
+                // sub-millisecond timestamp jitter all through steady
+                // playback (50-95 "+0 ms" lines per session, 2026-09-15).
+                // The clock is bounded either way.
+                if (llabs(bounded - pos) >= MP_TIME_MS_TO_NS(1) &&
+                    now - p->last_bound_warn > MP_TIME_S_TO_NS(1)) {
+                    p->last_bound_warn = now;
+                    MP_WARN(ao, "position bounded: reported %+" PRId64 " ms from prediction, "
+                            "passed %+" PRId64 " ms\n", (pos - expected) / 1000000,
+                            (bounded - expected) / 1000000);
+                }
+                pos = bounded;
+                delay = MPMAX(out_ns - pos, 0);
+            }
+        }
+    } else if (p->trk_valid && pos == p->trk_pos &&
+               now - p->last_bound_warn > MP_TIME_S_TO_NS(1) &&
+               pending > 2 * (int64_t)ao->device_buffer) {
+        // Kodi PR 24729 (superviseaudiodelay): a sink whose position does
+        // not move while more than twice its buffer has been fed is stuck.
+        // Reported only; the stalled position is passed through above.
+        p->last_bound_warn = now;
+        MP_WARN(ao, "device position stuck at %" PRId64 " with %" PRId64 " frames pending\n",
+                pos / 1000000, pending);
+    }
+    p->trk_pos = pos;
+    p->trk_time = active_now;
+    p->trk_valid = p->pair_valid;
     // mpv may use MONOTONIC_RAW with a different epoch. Convert the remaining
     // duration, never an absolute CLOCK_MONOTONIC timestamp, to its clock.
     int64_t end_time = mp_time_ns() + delay +
