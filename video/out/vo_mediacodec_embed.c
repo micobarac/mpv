@@ -74,11 +74,20 @@ typedef void (*torro_subs_clear_fn)(void);
 // compositor with a presentation timestamp
 // (`av_mediacodec_render_buffer_at_time`). The compositor then shows
 // it at the right vsync no matter what this process is doing in the
-// meantime. Media3 measured the same fix on MediaTek A53 TV SoCs
-// (androidx/media #2990): frame drops 0.139% -> 0.008% once frames
-// could go out up to ~200 ms early, ~150 ms observed in practice;
-// Kodi releases 1.5 vsyncs early on top of a 4-frame queue.
-#define TORRO_EARLY_RELEASE_NS MP_TIME_MS_TO_NS(150)
+// meantime. Every frame parked at the compositor is a decoder output
+// buffer the decoder cannot reuse: OMX.MS.HEVC.Decoder refuses ACodec's
+// requests for 11 and 10 output buffers and grants 9, one spare beyond
+// its own minimum (ACodec.cpp:1176-1197, Android 11). At 150 ms and
+// 24 fps up to four frames sat in the compositor's queue, so any
+// compositor delay left the decoder with no buffer and it blocked on
+// the surface (BufferQueueProducer.cpp:371); the log signature is a
+// half-second decode stall followed by a catch-up burst and dropped
+// frames. 50 ms is Media3's shipping value
+// (MediaCodecVideoRenderer.java:212 DEFAULT_EARLY_SCHEDULING_THRESHOLD_US;
+// androidx/media #2990 proposed 200 ms for TV SoCs and was not merged):
+// one frame ahead at 24 fps, the rest of the slack stays with the
+// decoder, as under Kodi's surface mode (1.5 vsyncs early).
+#define TORRO_EARLY_RELEASE_NS MP_TIME_MS_TO_NS(50)
 
 static torro_subs_present_fn g_subs_present;
 static torro_subs_clear_fn   g_subs_clear;
@@ -151,10 +160,10 @@ struct priv {
     int64_t next_display_ns;
     // Frames handed to the compositor but not yet on screen: their
     // display time and media pts. Subtitles are rendered for the frame
-    // that is on screen NOW, not the one just released 150 ms early —
-    // see flip_page. Kodi RendererMediaCodecSurface-21.2.cpp:107-121 and
-    // RenderManager-21.2.cpp:719-723 separate release from overlay time.
-    // mpv adaptation: 150 ms at 60 Hz needs ten pending timestamps;
+    // that is on screen NOW, not the one just released TORRO_EARLY_RELEASE_NS
+    // early — see flip_page. Kodi RendererMediaCodecSurface-21.2.cpp:107-121
+    // and RenderManager-21.2.cpp:719-723 separate release from overlay time.
+    // mpv adaptation: 50 ms at 60 Hz needs four pending timestamps;
     // sixteen bounded metadata entries include the currently submitted frame.
     // No additional codec buffers, surfaces, or presentation lead.
     struct { int64_t display_ns; double pts; } in_flight[16];
