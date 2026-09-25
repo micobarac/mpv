@@ -65,6 +65,7 @@ struct priv {
     bool pair_valid;
     int64_t pair_pos, pair_time;
     int32_t xruns;
+    int32_t xruns_logged;
     int64_t last_pair_warn, last_bound_warn;
 
     int device_api;
@@ -320,8 +321,22 @@ static aaudio_data_callback_result_t data_callback(AAudioStream *stream, void *c
     }
     int32_t xruns = p->AAudioStream_getXRunCount(stream);
     if (xruns != p->xruns) {
-        MP_WARN(ao, "device underrun count %" PRId32 " -> %" PRId32 "\n", p->xruns, xruns);
+        // An underrun is a real discontinuity: the device played silence and
+        // its position jumped by that much. Take the next report unbounded
+        // instead of converging on it at 10 % of real time through the clamp
+        // below (a 200 ms underrun otherwise stayed in the delay for ~2 s).
+        if (xruns > p->xruns)
+            p->trk_valid = false;
         p->xruns = xruns;
+        // Warn at most once a second, like the pair diagnostics above: this
+        // runs on the real-time callback and mp_msg takes the log locks.
+        if (warn_ok) {
+            p->last_pair_warn = now;
+            warn_ok = false;
+            MP_WARN(ao, "device underrun count %" PRId32 " -> %" PRId32 "\n",
+                    p->xruns_logged, xruns);
+            p->xruns_logged = xruns;
+        }
     }
 
     // Kodi 21.2 AESinkAUDIOTRACK.cpp:703-741 advances the timestamp's

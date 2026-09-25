@@ -133,6 +133,9 @@ struct track {
     bool auto_loaded;
 
     bool demuxer_ready; // if more packets should be read (subtitles only)
+    // A non-blocking subtitle read was skipped because the mediacodec_embed
+    // subtitle worker held the decoder lock; retried from the play loop.
+    bool sub_read_pending;
 
     struct demuxer *demuxer;
     // Invariant: !stream || stream->demuxer == demuxer

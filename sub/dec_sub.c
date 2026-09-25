@@ -571,11 +571,16 @@ int sub_control(struct dec_sub *sub, enum sd_ctrl cmd, void *arg)
 // Return false only when the caller must perform the initial file preload.
 bool sub_try_update_video(struct dec_sub *sub, double video_pts,
                           struct mp_image_params *params, bool fully_read,
-                          bool *packets_read)
+                          bool *packets_read, bool *busy)
 {
     *packets_read = true;
-    if (mp_mutex_trylock(&sub->lock))
+    *busy = false;
+    if (mp_mutex_trylock(&sub->lock)) {
+        // The worker is rendering under this lock. Do not delay the frame,
+        // but report the skipped read so the core retries it shortly.
+        *busy = true;
         return true;
+    }
     if (fully_read && sub->sd->driver->accept_packets_in_advance &&
         !sub->preload_attempted) {
         mp_mutex_unlock(&sub->lock);

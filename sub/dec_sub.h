@@ -59,9 +59,11 @@ void sub_destroy(struct dec_sub *sub);
 bool sub_can_preload(struct dec_sub *sub);
 void sub_preload(struct dec_sub *sub);
 // Nonblocking update for running native-video playback; see dec_sub.c.
+// *busy is set when the subtitle worker holds the lock and nothing was read;
+// the caller must retry the read soon (player/sub.c sub_read_pending).
 bool sub_try_update_video(struct dec_sub *sub, double video_pts,
                           struct mp_image_params *params, bool fully_read,
-                          bool *packets_read);
+                          bool *packets_read, bool *busy);
 void sub_redecode_cached_packets(struct dec_sub *sub);
 void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
                       bool *packets_read, bool *sub_updated);

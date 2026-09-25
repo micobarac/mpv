@@ -852,7 +852,8 @@ static void handle_update_subtitles(struct MPContext *mpctx)
 
     for (int n = 0; n < mpctx->num_tracks; n++) {
         struct track *track = mpctx->tracks[n];
-        if (track->type == STREAM_SUB && !track->demuxer_ready) {
+        if (track->type == STREAM_SUB &&
+            (!track->demuxer_ready || track->sub_read_pending)) {
             update_subtitles(mpctx, mpctx->playback_pts);
             break;
         }

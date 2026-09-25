@@ -100,6 +100,8 @@ static bool update_subtitle(struct MPContext *mpctx, double video_pts,
     if (!dec_sub)
         return true;
 
+    track->sub_read_pending = false;
+
     // Kodi 21.2 RenderManager.cpp:700-723 separates video presentation and
     // overlays. A busy bitmap worker must not delay MediaCodec submission.
     // Preserve blocking synchronization for startup, seeks, explicit redraws,
@@ -110,10 +112,19 @@ static bool update_subtitle(struct MPContext *mpctx, double video_pts,
         !track->redraw_subs &&
         !strcmp(mpctx->video_out->driver->name, "mediacodec_embed")) {
         struct mp_image_params params = mpctx->vo_chain->filter->input_params;
-        bool packets_read;
+        bool packets_read, busy;
         if (sub_try_update_video(dec_sub, video_pts, &params,
-                                 track->demuxer->fully_read, &packets_read))
+                                 track->demuxer->fully_read, &packets_read,
+                                 &busy)) {
+            // Returning "read" while the worker held the lock skipped this
+            // frame's packet read; with renders as long as a frame interval
+            // new cues stayed unread. Retry from the play loop in 10 ms.
+            if (busy) {
+                track->sub_read_pending = true;
+                mp_set_timeout(mpctx, 0.010);
+            }
             return packets_read;
+        }
     }
 
     if (mpctx->vo_chain) {
