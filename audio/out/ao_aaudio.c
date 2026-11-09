@@ -65,8 +65,8 @@ struct priv {
     bool pair_valid;
     int64_t pair_pos, pair_time;
     int32_t xruns;
-    int32_t xruns_logged;
-    int64_t last_pair_warn, last_bound_warn;
+    // Callback-owned counters, read only after AAudioStream_close.
+    unsigned timestamp_anomalies, clock_corrections, stalled_callbacks;
 
     int device_api;
     void *lib_handle;
@@ -283,36 +283,21 @@ static aaudio_data_callback_result_t data_callback(AAudioStream *stream, void *c
                                          &presented, &present_time);
     int64_t now = monotonic_time_ns();
     int64_t paused_duration = atomic_load(&p->paused_duration);
-    bool warn_ok = now - p->last_pair_warn > MP_TIME_S_TO_NS(1);
-    if (result < 0) {
-        MP_TRACE(ao, "AAudioStream_getTimestamp() returned %s\n",
-                 p->AAudio_convertResultToText(result));
-    } else if (presented >= 0 && presented <= written &&
-               present_time > 0 && present_time >= epoch && present_time <= now) {
+    if (result >= 0 && presented >= 0 && presented <= written &&
+        present_time > 0 && present_time >= epoch && present_time <= now) {
         int64_t active_time = present_time - paused_duration;
-        // Diagnostics only. VLC clock.c:37,436-454: the rate between two
-        // clock points must stay within 0.8..1.2 of real time, or the
-        // source is not trusted. Media3 AudioTimestampPoller.java:332-339:
-        // a pair more than 5 s from the device's own read counter is
-        // spurious. Neither changes the clock here; both name the pair.
-        if (p->pair_valid && active_time > p->pair_time && warn_ok) {
+        // Keep diagnostics off the real-time logging path.
+        if (p->pair_valid && active_time > p->pair_time) {
             int64_t dpos_ns = MP_TIME_S_TO_NS(presented - p->pair_pos) / ao->samplerate;
             int64_t rate_permille = dpos_ns * 1000 / (active_time - p->pair_time);
-            if (rate_permille < 800 || rate_permille > 1200) {
-                p->last_pair_warn = now; warn_ok = false;
-                MP_WARN(ao, "timestamp rate %" PRId64 "/1000 of real time: presented=%" PRId64
-                        " prev=%" PRId64 " dt_ms=%" PRId64 "\n", rate_permille, presented,
-                        p->pair_pos, (active_time - p->pair_time) / 1000000);
-            }
+            if (rate_permille < 800 || rate_permille > 1200)
+                p->timestamp_anomalies++;
         }
         int64_t device_read = p->AAudioStream_getFramesRead(stream);
         int64_t read_gap = presented > device_read ? presented - device_read
                                                    : device_read - presented;
-        if (warn_ok && read_gap > 5 * (int64_t)ao->samplerate) {
-            p->last_pair_warn = now; warn_ok = false;
-            MP_WARN(ao, "timestamp %" PRId64 " disagrees with frames read %" PRId64 "\n",
-                    presented, device_read);
-        }
+        if (read_gap > 5 * (int64_t)ao->samplerate)
+            p->timestamp_anomalies++;
         p->pair_pos = presented;
         p->pair_time = active_time;
         p->pair_valid = true;
@@ -328,15 +313,7 @@ static aaudio_data_callback_result_t data_callback(AAudioStream *stream, void *c
         if (xruns > p->xruns)
             p->trk_valid = false;
         p->xruns = xruns;
-        // Warn at most once a second, like the pair diagnostics above: this
-        // runs on the real-time callback and mp_msg takes the log locks.
-        if (warn_ok) {
-            p->last_pair_warn = now;
-            warn_ok = false;
-            MP_WARN(ao, "device underrun count %" PRId32 " -> %" PRId32 "\n",
-                    p->xruns_logged, xruns);
-            p->xruns_logged = xruns;
-        }
+
     }
 
     // Kodi 21.2 AESinkAUDIOTRACK.cpp:703-741 advances the timestamp's
@@ -380,31 +357,15 @@ static aaudio_data_callback_result_t data_callback(AAudioStream *stream, void *c
             int64_t max_drift = elapsed * 10 / 100;
             int64_t bounded = MPCLAMP(pos, expected - max_drift, expected + max_drift);
             if (bounded != pos) {
-                // Log only corrections the line can show: the printout is
-                // whole milliseconds, and the 10 % window trips on the HAL's
-                // sub-millisecond timestamp jitter all through steady
-                // playback (50-95 "+0 ms" lines per session, 2026-09-15).
-                // The clock is bounded either way.
-                if (llabs(bounded - pos) >= MP_TIME_MS_TO_NS(1) &&
-                    now - p->last_bound_warn > MP_TIME_S_TO_NS(1)) {
-                    p->last_bound_warn = now;
-                    MP_WARN(ao, "position bounded: reported %+" PRId64 " ms from prediction, "
-                            "passed %+" PRId64 " ms\n", (pos - expected) / 1000000,
-                            (bounded - expected) / 1000000);
-                }
+                if (llabs(bounded - pos) >= MP_TIME_MS_TO_NS(1))
+                    p->clock_corrections++;
                 pos = bounded;
                 delay = MPMAX(out_ns - pos, 0);
             }
         }
     } else if (p->trk_valid && pos == p->trk_pos &&
-               now - p->last_bound_warn > MP_TIME_S_TO_NS(1) &&
                pending > 2 * (int64_t)ao->device_buffer) {
-        // Kodi PR 24729 (superviseaudiodelay): a sink whose position does
-        // not move while more than twice its buffer has been fed is stuck.
-        // Reported only; the stalled position is passed through above.
-        p->last_bound_warn = now;
-        MP_WARN(ao, "device position stuck at %" PRId64 " with %" PRId64 " frames pending\n",
-                pos / 1000000, pending);
+        p->stalled_callbacks++;
     }
     p->trk_pos = pos;
     p->trk_time = active_now;
@@ -426,6 +387,13 @@ static void uninit(struct ao *ao)
     if (p->stream) {
         p->AAudioStream_close(p->stream);
         p->stream = NULL;
+        if (p->xruns > 0 || p->timestamp_anomalies || p->clock_corrections ||
+            p->stalled_callbacks) {
+            MP_WARN(ao, "AAudio summary: underruns=%" PRId32 ", timestamp anomalies=%u, "
+                    "clock corrections=%u, stalled callbacks=%u\n",
+                    p->xruns, p->timestamp_anomalies, p->clock_corrections,
+                    p->stalled_callbacks);
+        }
     }
 
     if (p->lib_handle) {
