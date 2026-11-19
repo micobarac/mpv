@@ -3245,17 +3245,16 @@ static int read_block_group(demuxer_t *demuxer, int64_t end,
 
     while (stream_tell(s) < end) {
         switch (ebml_read_id(s)) {
-        case MATROSKA_ID_BLOCKDURATION:
-            block->duration = ebml_read_uint(s);
-            if (block->duration == EBML_UINT_INVALID)
+        case MATROSKA_ID_BLOCKDURATION:;
+            uint64_t duration;
+            if (!ebml_read_uint(s, &duration))
                 goto error;
-            block->duration *= mkv_d->tc_scale;
+            block->duration = duration * mkv_d->tc_scale;
             block->duration_known = true;
             break;
 
         case MATROSKA_ID_DISCARDPADDING:
-            block->discardpadding = ebml_read_uint(s);
-            if (block->discardpadding == EBML_UINT_INVALID)
+            if (!ebml_read_uint(s, &block->discardpadding))
                 goto error;
             break;
 
@@ -3265,8 +3264,8 @@ static int read_block_group(demuxer_t *demuxer, int64_t end,
             break;
 
         case MATROSKA_ID_REFERENCEBLOCK:;
-            int64_t num = ebml_read_int(s);
-            if (num == EBML_INT_INVALID)
+            int64_t num;
+            if (!ebml_read_int(s, &num))
                 goto error;
             block->keyframe = false;
             break;
@@ -3314,8 +3313,8 @@ static int read_next_block_into_queue(demuxer_t *demuxer)
             int64_t start_filepos = stream_tell(s);
             switch (ebml_read_id(s)) {
             case MATROSKA_ID_TIMECODE: {
-                uint64_t num = ebml_read_uint(s);
-                if (num == EBML_UINT_INVALID)
+                uint64_t num;
+                if (!ebml_read_uint(s, &num))
                     goto find_next_cluster;
                 mkv_d->cluster_tc = num * mkv_d->tc_scale;
                 break;
